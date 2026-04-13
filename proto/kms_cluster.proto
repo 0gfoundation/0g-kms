@@ -1,0 +1,44 @@
+syntax = "proto3";
+package kms_cluster;
+
+import "google/protobuf/empty.proto";
+
+// ─── Inter-node KMS protocol ──────────────────────────────────────────────────
+//
+// Auth is carried in gRPC metadata on every call:
+//   "signature" : recoverable secp256k1 ECDSA signature (hex, 65 bytes)
+//                 over "kms:{method}:{timestamp}"
+//   "timestamp" : Unix seconds (string), rejected if |now - timestamp| > 300
+//
+// Responder auth flow:
+//   1. Recover caller's public key + eth address from signature.
+//   2. Call getNodeList(own_app_id) on-chain; verify caller address is in the list.
+//   3. ECIES-encrypt response with caller's recovered secp256k1 public key.
+//   (Phase 2: additionally verify TDX attestation quote)
+
+service KmsCluster {
+  // Return this node's own shard, encrypted for the caller.
+  // Called by a coordinator peer during app-key serving or recovery.
+  // Coordinator calls ALL healthy peers so it can reconstruct masterKey
+  // and identify the missing shard_index of any failed node.
+  rpc GetShardContribution(google.protobuf.Empty) returns (EncryptedShard);
+
+  // Assign and return the shard that belongs to the caller.
+  // Server-side behavior differs from GetShardContribution:
+  //   - Init:     start node holds all N shards; assigns one based on
+  //               caller's position in nodeList.
+  //   - Recovery: coordinator collects shards from all healthy peers,
+  //               reconstructs masterKey, identifies the missing shard_index,
+  //               generates the missing shard and returns it to the caller.
+  rpc RequestShard(google.protobuf.Empty) returns (EncryptedShard);
+}
+
+// ─── Shared response ──────────────────────────────────────────────────────────
+
+message EncryptedShard {
+  // ECIES ciphertext of the shard bytes,
+  // encrypted for the caller's recovered secp256k1 public key.
+  bytes  ciphertext  = 1;
+  // Shard index (x-coordinate in the SSS polynomial).
+  uint32 shard_index = 2;
+}

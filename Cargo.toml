@@ -1,0 +1,68 @@
+[package]
+name = "kms"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kms-server"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum = "0.7"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tower = "0.4"
+
+# gRPC (inter-node communication)
+tonic = "0.11"
+prost = "0.12"
+
+# Async utilities
+futures = "0.3"
+
+# Crypto
+k256 = { version = "0.13", features = ["ecdsa", "std"] }
+elliptic-curve = { version = "0.13", features = ["ff"] }
+generic-array = "0.14"
+typenum = "1"
+sha2 = "0.10"
+hkdf = "0.12"
+sha3 = "0.10"
+# ECIES encryption compatible with eciesjs
+# Config 1: secp256k1 + AES-256-GCM (OpenSSL, best performance) ← CURRENT
+ecies = { version = "0.2", features = ["std"] }
+# Config 2: secp256k1 + XChaCha20-Poly1305 (Pure Rust)
+# ecies = { version = "0.2", default-features = false, features = ["xchacha20"] }
+# Config 3: curve25519 (x25519) + AES-256-GCM (OpenSSL)
+# ecies = { version = "0.2", features = ["std", "x25519"] }
+# Config 4: curve25519 (x25519) + XChaCha20-Poly1305 (Pure Rust)
+# ecies = { version = "0.2", default-features = false, features = ["x25519", "xchacha20"] }
+hex = "0.4"
+rand = "0.8"
+
+# Shamir's Secret Sharing
+vsss-rs = { version = "3", features = ["std"] }
+
+# On-chain lookup (ethers for reading contract state)
+ethers = { version = "2.0", default-features = false, features = ["rustls", "abigen"] }
+
+# Config & serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Error handling & logging
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio-test = "0.4"
+
+[build-dependencies]
+tonic-build = "0.11"

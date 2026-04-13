@@ -1,0 +1,19 @@
+[server]
+bind = "0.0.0.0:8080"
+grpc_bind = "0.0.0.0:9090"
+timestamp_tolerance_secs = 300
+
+[tapp]
+app_id = "0g-kms"
+tapp_ip = "host.docker.internal"
+tapp_port = 50051
+mock_tee = false
+
+[chain]
+rpc_url = "https://evmrpc-testnet.0g.ai"
+contract_address = "0x95a0BF4148b30F6F8D86870534c51df46Da5511c"
+
+[cluster]
+threshold = 2
+total_nodes = 3
+peers = ["http://47.245.117.71:9092", "http://8.222.225.233:9092"]
