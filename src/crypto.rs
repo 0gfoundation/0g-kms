@@ -118,6 +118,64 @@ pub fn sss_reconstruct(shards: &[(u32, Vec<u8>)]) -> Result<[u8; 32]> {
     Ok(scalar.to_repr().into())
 }
 
+/// Evaluate the original SSS polynomial at coordinate `x` using Lagrange interpolation
+/// over the existing shares.  Returns a 33-byte share [x, y[0..32]] that is consistent
+/// with the other shares (same polynomial), unlike a fresh sss_split which uses a new
+/// random polynomial and produces incompatible shares.
+pub fn sss_evaluate_at(shards: &[(u32, Vec<u8>)], x: u32) -> Result<Vec<u8>> {
+    use elliptic_curve::ff::PrimeField;
+    use k256::Scalar;
+
+    // Parse each shard into (x_i, y_i) scalars.
+    // vsss-rs share format: bytes[0] = x-coord, bytes[1..33] = y-coord.
+    let points: Vec<(Scalar, Scalar)> = shards
+        .iter()
+        .map(|(_, bytes)| {
+            if bytes.len() != 33 {
+                return Err(anyhow!("shard must be 33 bytes, got {}", bytes.len()));
+            }
+            let x_i = scalar_from_u8(bytes[0]);
+            let y_repr = *GenericArray::from_slice(&bytes[1..]);
+            let y_i = Option::<Scalar>::from(Scalar::from_repr(y_repr))
+                .ok_or_else(|| anyhow!("invalid scalar in shard"))?;
+            Ok((x_i, y_i))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let x_s = scalar_from_u8(x as u8);
+
+    // Lagrange interpolation: f(x) = Σ y_i · L_i(x)
+    // where L_i(x) = Π_{j≠i} (x - x_j) / (x_i - x_j)
+    let mut result = Scalar::ZERO;
+    for (i, (x_i, y_i)) in points.iter().enumerate() {
+        let mut num = Scalar::ONE;
+        let mut den = Scalar::ONE;
+        for (j, (x_j, _)) in points.iter().enumerate() {
+            if i != j {
+                num *= x_s - x_j;
+                den *= x_i - x_j;
+            }
+        }
+        let den_inv = Option::<Scalar>::from(den.invert())
+            .ok_or_else(|| anyhow!("zero denominator — duplicate x-coordinates?"))?;
+        result += *y_i * num * den_inv;
+    }
+
+    // Pack result into 33-byte vsss-rs share format.
+    let mut share_bytes = vec![x as u8];
+    let repr: [u8; 32] = result.to_repr().into();
+    share_bytes.extend_from_slice(&repr);
+    Ok(share_bytes)
+}
+
+fn scalar_from_u8(x: u8) -> k256::Scalar {
+    use elliptic_curve::ff::PrimeField;
+    let mut repr = [0u8; 32];
+    repr[31] = x;
+    Option::<k256::Scalar>::from(k256::Scalar::from_repr(*GenericArray::from_slice(&repr)))
+        .expect("single byte is always a valid scalar")
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -170,5 +228,22 @@ mod tests {
         let privkey: [u8; 32] = signing_key.to_bytes().into();
         let sig = sign_request(&privkey, "GetShardContribution", 1234567890).unwrap();
         assert_eq!(sig.len(), 65);
+    }
+
+    #[test]
+    fn test_sss_evaluate_at_consistent_with_split() {
+        let secret = [0x77u8; 32];
+        // threshold=2, total=3 → degree-1 polynomial
+        let shards = sss_split(&secret, 2, 3).unwrap();
+
+        // Interpolate shard[2] from shard[0] + shard[1]
+        let recovered2 = sss_evaluate_at(&shards[..2], shards[2].0).unwrap();
+        assert_eq!(recovered2, shards[2].1,
+            "Lagrange-interpolated shard must match original split shard");
+
+        // Interpolate shard[0] from shard[1] + shard[2]
+        let recovered0 = sss_evaluate_at(&shards[1..], shards[0].0).unwrap();
+        assert_eq!(recovered0, shards[0].1,
+            "Lagrange-interpolated shard must match original split shard (reverse)");
     }
 }

@@ -16,4 +16,5 @@ contract_address = "0x95a0BF4148b30F6F8D86870534c51df46Da5511c"
 [cluster]
 threshold = 2
 total_nodes = 3
-peers = ["http://47.236.111.154:9092", "http://47.245.117.71:9092"]
+self_url = "http://8.222.225.233:9091"
+seeds = ["http://47.236.111.154:9091"]

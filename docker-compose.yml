@@ -1,7 +1,7 @@
 services:
   kms:
     image: eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-kms:latest
-    command: ["kms-server", "--init", "/config/kms.toml"]
+    command: ["kms-server", "/config/kms.toml"]
     ports:
       - "8090:8080"
       - "9092:9090"

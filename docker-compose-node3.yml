@@ -4,7 +4,7 @@ services:
     command: ["kms-server", "/config/kms.toml"]
     ports:
       - "8090:8080"
-      - "9092:9090"
+      - "9091:9090"
     volumes:
       - ./kms-node3.toml:/config/kms.toml:ro
     extra_hosts:
