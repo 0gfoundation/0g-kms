@@ -20,43 +20,45 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let mut args = std::env::args().skip(1);
-    let mut config_path = "kms.toml".to_string();
-    let mut is_start_node = false;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--init" => is_start_node = true,
-            _ => config_path = arg,
-        }
-    }
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "kms.toml".to_string());
 
     let config = config::Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path))?;
 
-    // Fetch signing key from tapp-server (or mock)
     let signing_key = tee::fetch_signing_key(&config.tapp)
         .await
         .context("Failed to fetch signing key")?;
 
     info!(
         eth_address = format!("0x{}", hex::encode(signing_key.eth_address)),
-        is_start_node,
+        bootstrap = config.cluster.bootstrap,
+        self_url = %config.cluster.self_url,
         "Node signing key loaded"
     );
 
     let state = server::AppState::new(config.clone(), signing_key);
 
-    // Init: either generate shards (start node) or fetch shard from peers
-    if is_start_node {
-        init::init_start_node(&state)
-            .await
-            .context("Start node initialization failed")?;
+    // Bootstrap node: try to join first (handles restarts gracefully).
+    // If join fails and bootstrap=true, generate the masterKey as the first node.
+    // Non-bootstrap nodes always join and fail hard if they can't.
+    if config.cluster.bootstrap {
+        match init::join_cluster(&state).await {
+            Ok(_) => info!("Rejoined existing cluster"),
+            Err(e) => {
+                info!(error = %e, "Join failed — bootstrapping as first node");
+                init::init_start_node(&state)
+                    .await
+                    .context("Bootstrap initialization failed")?;
+            }
+        }
     } else {
         init::join_cluster(&state)
             .await
             .context("Failed to join cluster")?;
     }
+
+    // Start gossip background task (peer discovery + liveness)
+    grpc::start_gossip_task(state.clone());
 
     let http_addr = config.server.bind.clone();
     let grpc_addr = config.server.grpc_bind.clone();

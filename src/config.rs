@@ -56,9 +56,20 @@ pub struct ClusterConfig {
     pub threshold: u32,
     /// Total number of nodes in the KMS cluster.
     pub total_nodes: u32,
-    /// gRPC URLs of all peer nodes (excluding self).
+    /// If true: on startup, try to join first; if join fails, bootstrap as the
+    /// first node (generate and split masterKey).  Set this only on the
+    /// designated bootstrap node.
     #[serde(default)]
-    pub peers: Vec<String>,
+    pub bootstrap: bool,
+    /// This node's own gRPC URL as seen by peers (e.g. "http://1.2.3.4:9092").
+    /// Required for gossip to work.
+    #[serde(default)]
+    pub self_url: String,
+    /// Seed peers used at startup for initial contact (gRPC URLs).
+    /// After startup the runtime peer table is maintained by gossip.
+    /// Field was previously named "peers" — both names are accepted.
+    #[serde(default, alias = "peers")]
+    pub seeds: Vec<String>,
 }
 
 impl Config {

@@ -6,69 +6,59 @@ use crate::{
     server::{AppState, ShardState},
 };
 
-/// Start-node init flow:
+/// Bootstrap flow (first node ever):
 ///   1. Generate masterKey.
 ///   2. SSS split into total_nodes shards.
 ///   3. Store own shard (position 0 in nodeList) in state.shard.
 ///   4. Store all shards in state.pending_shards for peers to pull.
-///
-/// Peers will call RequestShard (grpc.rs) to collect their assigned shard.
 pub async fn init_start_node(state: &AppState) -> Result<()> {
     let threshold = state.config.cluster.threshold;
     let total = state.config.cluster.total_nodes;
 
     info!(threshold, total, "Generating masterKey and splitting into shards");
 
-    // Generate random masterKey
     let master_key = rand_key();
-
-    // SSS split
     let shards = sss_split(&master_key, threshold, total)?;
 
-    // Start node is position 0 in nodeList — take the first shard
     let (own_index, own_bytes) = shards
         .first()
         .ok_or_else(|| anyhow!("SSS produced no shards"))?
         .clone();
 
-    info!(shard_index = own_index, "Start node shard assigned");
+    info!(shard_index = own_index, "Bootstrap node shard assigned");
 
-    // Store own shard
     *state.shard.write().await = Some(ShardState {
         shard_index: own_index,
         shard_bytes: own_bytes,
     });
-
-    // Store all shards for peers to pull
     *state.pending_shards.write().await = Some(shards);
 
-    info!("Start node ready — waiting for peers to collect their shards");
+    info!("Bootstrap node ready — waiting for peers to collect their shards");
     Ok(())
 }
 
-/// Join flow (non-start node or restarted node):
-///   1. Pick a coordinator from config.cluster.peers.
+/// Join flow (non-bootstrap node, or restarted node):
+///   1. Pick a seed from config.cluster.seeds.
 ///   2. Call RequestShard via gRPC.
 ///   3. Decrypt the response.
 ///   4. Store own shard.
 pub async fn join_cluster(state: &AppState) -> Result<()> {
-    let peers = &state.config.cluster.peers;
-    if peers.is_empty() {
-        return Err(anyhow!("no peers configured — cannot join cluster"));
+    let seeds = &state.config.cluster.seeds;
+    if seeds.is_empty() {
+        return Err(anyhow!("no seeds configured — cannot join cluster"));
     }
 
-    info!(peers = ?peers, "Joining cluster — requesting shard from peers");
+    info!(seeds = ?seeds, "Joining cluster — requesting shard from seeds");
 
     let timestamp = chrono::Utc::now().timestamp();
     let sig = sign_request(&state.signing_key.private_key, "RequestShard", timestamp)?;
 
-    // Try peers in order until one succeeds
-    let mut last_err = anyhow!("all peers failed");
-    for peer_url in peers {
-        match request_shard_from_peer(peer_url, &sig, timestamp, state).await {
+    let mut last_err = anyhow!("all seeds failed");
+    for seed_url in seeds {
+        match request_shard_from_peer(seed_url, &sig, timestamp, state).await {
             Ok(shard) => {
                 info!(
-                    peer = %peer_url,
+                    peer = %seed_url,
                     shard_index = shard.shard_index,
                     "Shard received and stored"
                 );
@@ -76,7 +66,7 @@ pub async fn join_cluster(state: &AppState) -> Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                tracing::warn!(peer = %peer_url, error = %e, "RequestShard failed");
+                tracing::warn!(peer = %seed_url, error = %e, "RequestShard failed");
                 last_err = e;
             }
         }

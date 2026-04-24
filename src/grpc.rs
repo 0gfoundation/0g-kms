@@ -191,6 +191,12 @@ impl KmsClusterService {
             }
         }
 
+        // Dedup by x-coordinate (bytes[0]): stale peer_table entries can cause
+        // the same shard to be fetched twice, which would crash SSS with
+        // SharingDuplicateIdentifier / zero denominator.
+        let mut seen = std::collections::HashSet::new();
+        shards.retain(|(_, bytes)| !bytes.is_empty() && seen.insert(bytes[0]));
+
         if shards.len() < self.state.config.cluster.threshold as usize {
             return Err(Status::unavailable(format!(
                 "not enough shards for recovery: got {}, need {}",
@@ -288,6 +294,12 @@ pub async fn collect_and_reconstruct(state: &AppState) -> Result<[u8; 32], crate
             Err(e) => tracing::warn!(error = %e, "peer shard collection failed"),
         }
     }
+
+    // Dedup by x-coordinate (bytes[0]): stale peer_table entries can cause the
+    // same shard to be fetched twice, which would crash SSS with
+    // SharingDuplicateIdentifier.
+    let mut seen = std::collections::HashSet::new();
+    shards.retain(|(_, bytes)| !bytes.is_empty() && seen.insert(bytes[0]));
 
     if shards.len() < state.config.cluster.threshold as usize {
         return Err(crate::error::KmsError::CryptoError(format!(

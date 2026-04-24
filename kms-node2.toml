@@ -1,6 +1,6 @@
 [server]
-bind = "0.0.0.0:8080"
-grpc_bind = "0.0.0.0:9090"
+bind = "0.0.0.0:9090"
+grpc_bind = "0.0.0.0:9092"
 timestamp_tolerance_secs = 300
 
 [tapp]
@@ -16,5 +16,5 @@ contract_address = "0x95a0BF4148b30F6F8D86870534c51df46Da5511c"
 [cluster]
 threshold = 2
 total_nodes = 3
-self_url = "http://8.222.225.233:9091"
-seeds = ["http://47.236.111.154:9091"]
+self_url = "http://8.222.225.233:9092"
+seeds = ["http://47.236.111.154:9092"]

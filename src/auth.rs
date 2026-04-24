@@ -11,7 +11,8 @@
 ///   3. Call getNodeList(own_app_id) on-chain; verify caller is in the list.
 ///
 /// On success returns the caller's recovered secp256k1 public key (65 bytes,
-/// uncompressed) so the handler can ECIES-encrypt its response for the caller.
+/// uncompressed) and eth address so handlers can ECIES-encrypt responses and
+/// update the peer table.
 use anyhow::{anyhow, Result};
 use ethers::types::Address;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
@@ -24,6 +25,8 @@ use crate::config::Config;
 pub struct AuthContext {
     /// Caller's recovered secp256k1 public key (65 bytes, uncompressed, 0x04 prefix).
     pub caller_pubkey: Vec<u8>,
+    /// Caller's Ethereum address derived from caller_pubkey.
+    pub caller_eth_addr: Address,
 }
 
 /// Authenticate an inbound gRPC request.
@@ -50,12 +53,12 @@ pub async fn authenticate(
         .map_err(|e| Status::unauthenticated(format!("invalid signature: {}", e)))?;
 
     // 3. Derive eth address and verify on-chain
-    let caller_addr = eth_address_from_pubkey(&caller_pubkey);
-    verify_on_chain(&caller_addr, config)
+    let caller_eth_addr = eth_address_from_pubkey(&caller_pubkey);
+    verify_on_chain(&caller_eth_addr, config)
         .await
         .map_err(|e| Status::unauthenticated(format!("on-chain verification failed: {}", e)))?;
 
-    Ok(AuthContext { caller_pubkey })
+    Ok(AuthContext { caller_pubkey, caller_eth_addr })
 }
 
 fn parse_metadata(metadata: &MetadataMap) -> Result<(Vec<u8>, i64), Status> {
