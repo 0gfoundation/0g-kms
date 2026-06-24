@@ -47,25 +47,30 @@ restart a few times until `kms1` has bootstrapped; that is expected (they crash-
 
 ## 2. Wait for bootstrap + gossip convergence (~40–60s)
 
-The coordinator discovers peers via gossip (first round ~5s after boot, then every 30s).
-A derive call before convergence sees only the local partial and fails the threshold —
-so wait until all three nodes know each other.
+The coordinator collects partials from peers it learned via gossip (first round ~5s after
+boot, then every 30s; full convergence typically ~60–90s). A derive call before its
+coordinator knows ≥1 peer sees only the local partial and fails the threshold.
 
 ```bash
+DC="docker compose -f docker-compose.test.yml"
 # kms1 generated and split the master:
-docker compose -f docker-compose.test.yml logs kms1 | grep -i "Bootstrap node ready"
+$DC logs kms1 | grep -i "Bootstrap node ready"
 # kms2 / kms3 received their shard:
-docker compose -f docker-compose.test.yml logs kms2 | grep -i "Shard received"
-docker compose -f docker-compose.test.yml logs kms3 | grep -i "Shard received"
-# gossip discovered peers (look for this on kms1):
-docker compose -f docker-compose.test.yml logs kms1 | grep -i "discovered new peer"
+$DC logs kms2 | grep -i "Shard received"
+$DC logs kms3 | grep -i "Shard received"
+# the node you will QUERY (kms1) has registered its peers — this is the readiness gate.
+# Expect ≥2 lines once kms2 and kms3 have gossiped in:
+$DC logs kms1 | grep -i "gossip: peer registered"
 ```
 
-Proceed once all four greps print a line.
+Proceed once the first three greps print a line and the last prints ≥1. If a derive call
+still returns `not enough partials`, gossip simply hasn't converged yet — wait ~30s and
+retry; it is not a failure.
 
 ## 3. Run the derivation tests
 
-The client prints the derived 32-byte app key as hex.
+The client prints the derived 32-byte app key as hex. The first `cargo run` compiles the
+client (~1 min); subsequent runs are instant.
 
 ```bash
 # from the repo root
@@ -117,7 +122,8 @@ F=$(run $N1 other-app aabbccdd $PRIV)
 
 ```bash
 docker compose -f test/local-cluster/docker-compose.test.yml stop kms3
-sleep 35   # let gossip prune the dead peer
+# kms1 still lists kms3 as a peer (pruning takes 5 min), but the fetch to the dead node
+# just fails and is skipped, leaving own + kms2 = 2 partials = threshold.
 G=$(run $N1 0g-kms aabbccdd $PRIV)
 [ "$A" = "$G" ] && echo "PASS: 2-of-3 still derives the same key" || echo "FAIL"
 ```
