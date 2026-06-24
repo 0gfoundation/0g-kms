@@ -40,8 +40,14 @@ ecies = { version = "0.2", features = ["std"] }
 hex = "0.4"
 rand = "0.8"
 
-# Shamir's Secret Sharing
-vsss-rs = { version = "3", features = ["std"] }
+# Threshold BLS (DPRF key derivation) — IETF BLS12-381, blst backend.
+# Pinned exactly (guardrail #1): we own the small slice of this crate we depend on.
+# Provides genesis SecretKey::split, per-node SecretKeyShare::sign (partial = f(i)·H(msg)),
+# and Signature::from_shares (in-group Lagrange combine — never reconstructs the master).
+blsful = "=3.1.0"
+# Shamir/VSS primitives (share repair on the recovery path). Aligned with blsful's vsss-rs;
+# also re-exported as `blsful::vsss_rs` to avoid version skew.
+vsss-rs = "5.1.0"
 
 # On-chain lookup (ethers for reading contract state)
 ethers = { version = "2.0", default-features = false, features = ["rustls", "abigen"] }
@@ -63,6 +69,9 @@ chrono = { version = "0.4", features = ["serde"] }
 [dev-dependencies]
 wiremock = "0.6"
 tokio-test = "0.4"
+# `examples/dprf_client.rs` only (test tooling). Not compiled into the release binary,
+# so it has zero impact on the production image (`cargo build --release --bin kms-server`).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [build-dependencies]
 tonic-build = "0.11"

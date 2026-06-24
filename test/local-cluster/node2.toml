@@ -1,0 +1,20 @@
+# kms2 — joining node (Anvil account #1, nodeList position 1 -> shard #2)
+[server]
+bind = "0.0.0.0:9090"
+grpc_bind = "0.0.0.0:9092"
+timestamp_tolerance_secs = 300
+
+[tapp]
+app_id = "0g-kms"
+mock_tee = true
+
+[chain]
+rpc_url = "http://mockchain:8545"
+contract_address = "0x0000000000000000000000000000000000000001"
+
+[cluster]
+threshold = 2
+total_nodes = 3
+bootstrap = false
+self_url = "http://kms2:9092"
+seeds = ["http://kms1:9092"]

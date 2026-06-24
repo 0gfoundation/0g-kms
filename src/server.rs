@@ -11,9 +11,9 @@ use tokio::sync::RwLock;
 use crate::{
     chain::get_signer_addresses,
     config::Config,
-    crypto::{derive_app_key, ecies_encrypt},
+    crypto::ecies_encrypt,
     error::KmsError,
-    grpc::collect_and_reconstruct,
+    grpc::collect_and_dprf,
     tee::NodeKey,
 };
 
@@ -88,6 +88,11 @@ pub struct AppKeyRequest {
     pub pubkey: String,
     /// hex-encoded recoverable secp256k1 signature over "GetSecretResource:{timestamp}"
     pub signature: String,
+    /// hex-encoded derivation material, bound into the derived key alongside `app_id`
+    /// (opaque to the KMS; for AgenticID = chainId ‖ contractAddress ‖ sealId).
+    /// Optional — absent/empty derives purely from the `app_id` namespace.
+    #[serde(default)]
+    pub material: String,
 }
 
 #[derive(Serialize)]
@@ -163,9 +168,11 @@ pub async fn handle_app_key(
         )));
     }
 
-    // 3. Concurrently collect peer shards, reconstruct masterKey, derive app key
-    let master_key = collect_and_reconstruct(&state).await?;
-    let app_key = derive_app_key(&master_key, &req.app_id);
+    // 3. Threshold-BLS DPRF: collect partials from ≥ threshold nodes and combine them into
+    //    the app key, bound to (app_id, material). The master is never reconstructed.
+    let material = hex::decode(req.material.trim_start_matches("0x"))
+        .map_err(|_| KmsError::CryptoError("invalid material hex".into()))?;
+    let app_key = collect_and_dprf(&state, &req.app_id, &material).await?;
 
     // 4. ECIES encrypt for caller
     let pubkey_bytes = hex::decode(req.pubkey.trim_start_matches("0x"))
