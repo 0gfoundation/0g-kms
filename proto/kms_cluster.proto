@@ -16,6 +16,12 @@ import "google/protobuf/empty.proto";
 //   3. ECIES-encrypt response with caller's recovered secp256k1 public key.
 
 service KmsCluster {
+  // Threshold-BLS DPRF: return this node's partial evaluation f(i)·H(msg) for the
+  // requested (app_id, material), encrypted for the caller. The coordinator combines
+  // partials from ≥ threshold nodes (in-group Lagrange) into the app key WITHOUT ever
+  // reconstructing the master. msg = bind(app_id, material) (see crypto::dprf_message).
+  rpc GetDprfPartial(DprfPartialRequest) returns (EncryptedPartial);
+
   // Return this node's own shard, encrypted for the caller.
   rpc GetShardContribution(google.protobuf.Empty) returns (EncryptedShard);
 
@@ -31,6 +37,18 @@ service KmsCluster {
   // Caller sends its own NodeInfo; responder updates its peer table and
   // returns its full known member list.  Acts as both discovery and heartbeat.
   rpc Gossip(GossipRequest) returns (GossipResponse);
+}
+
+// ─── DPRF messages ────────────────────────────────────────────────────────────
+
+message DprfPartialRequest {
+  string app_id   = 1;  // namespace (must match the responder's on-chain app_id)
+  bytes  material = 2;   // caller-supplied derivation material (opaque to the KMS)
+}
+
+message EncryptedPartial {
+  bytes  ciphertext  = 1;  // ECIES(partial signature bytes) for the caller
+  uint32 shard_index = 2;  // source node's shard index (for dedup at the coordinator)
 }
 
 // ─── Shard messages ───────────────────────────────────────────────────────────

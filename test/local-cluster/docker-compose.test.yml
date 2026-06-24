@@ -1,0 +1,67 @@
+name: kms-dprf-test
+
+# Self-contained 3-node KMS cluster for exercising the threshold-BLS DPRF (S1) path
+# end-to-end. Builds the image from the current source (so it runs the NEW code), uses
+# mock_tee node keys (Anvil accounts) and a mock JSON-RPC for getNodeList. No real chain,
+# no real TEE, no registry image pull.
+
+x-node-common: &node-common
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  image: 0g-kms:dprf-test
+  restart: unless-stopped
+  networks: [kmsnet]
+
+services:
+  mockchain:
+    image: python:3.12-slim
+    command: ["python3", "/app/mock-chain.py"]
+    volumes:
+      - ./mock-chain.py:/app/mock-chain.py:ro
+    networks: [kmsnet]
+
+  kms1:
+    <<: *node-common
+    command: ["kms-server", "/config/kms.toml"]
+    environment:
+      # Anvil account #0
+      MOCK_APP_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+      MOCK_APP_ETH_ADDRESS: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+      RUST_LOG: "kms=info"
+    volumes:
+      - ./node1.toml:/config/kms.toml:ro
+    ports:
+      - "9101:9090"   # HTTP /app-key
+    depends_on: [mockchain]
+
+  kms2:
+    <<: *node-common
+    command: ["kms-server", "/config/kms.toml"]
+    environment:
+      # Anvil account #1
+      MOCK_APP_PRIVATE_KEY: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+      MOCK_APP_ETH_ADDRESS: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+      RUST_LOG: "kms=info"
+    volumes:
+      - ./node2.toml:/config/kms.toml:ro
+    ports:
+      - "9102:9090"
+    depends_on: [kms1]
+
+  kms3:
+    <<: *node-common
+    command: ["kms-server", "/config/kms.toml"]
+    environment:
+      # Anvil account #2
+      MOCK_APP_PRIVATE_KEY: "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+      MOCK_APP_ETH_ADDRESS: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+      RUST_LOG: "kms=info"
+    volumes:
+      - ./node3.toml:/config/kms.toml:ro
+    ports:
+      - "9103:9090"
+    depends_on: [kms1]
+
+networks:
+  kmsnet:

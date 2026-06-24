@@ -2,27 +2,36 @@ use anyhow::{anyhow, Result};
 use tracing::info;
 
 use crate::{
-    crypto::{ecies_decrypt, sign_request, sss_split},
+    crypto::{ecies_decrypt, share_to_bytes, sign_request, split_master},
     server::{AppState, ShardState},
 };
 
 /// Bootstrap flow (first node ever):
-///   1. Generate masterKey.
-///   2. SSS split into total_nodes shards.
-///   3. Store own shard (position 0 in nodeList) in state.shard.
-///   4. Store all shards in state.pending_shards for peers to pull.
+///   1. Generate a fresh BLS12-381 master and Shamir-split it into total_nodes shares.
+///   2. Store own shard (position 0 in nodeList) in state.shard.
+///   3. Store all shards in state.pending_shards for peers to pull.
+///
+/// The master scalar is dropped after the split and never stored. (S2/DKG will later
+/// replace this dealer step with distributed key generation; the resulting shares are
+/// the same type, so the derivation path is unaffected.)
 pub async fn init_start_node(state: &AppState) -> Result<()> {
     let threshold = state.config.cluster.threshold;
     let total = state.config.cluster.total_nodes;
 
-    info!(threshold, total, "Generating masterKey and splitting into shards");
+    info!(threshold, total, "Generating BLS master and splitting into shards");
 
-    let master_key = rand_key();
-    let shards = sss_split(&master_key, threshold, total)?;
+    let shares = split_master(threshold as usize, total as usize)?;
+    // Shard index = 1-based position in the share vector (used for nodeList-position
+    // assignment and dedup). The Lagrange identifier travels inside the serialized share.
+    let shards: Vec<(u32, Vec<u8>)> = shares
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u32 + 1, share_to_bytes(s)))
+        .collect();
 
     let (own_index, own_bytes) = shards
         .first()
-        .ok_or_else(|| anyhow!("SSS produced no shards"))?
+        .ok_or_else(|| anyhow!("split produced no shards"))?
         .clone();
 
     info!(shard_index = own_index, "Bootstrap node shard assigned");
@@ -119,11 +128,4 @@ async fn request_shard_from_peer(
         shard_index: resp.shard_index,
         shard_bytes,
     })
-}
-
-fn rand_key() -> [u8; 32] {
-    use rand::RngCore;
-    let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
-    key
 }
