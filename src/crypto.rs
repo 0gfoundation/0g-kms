@@ -99,6 +99,33 @@ pub fn share_from_bytes(bytes: &[u8]) -> Result<SecretKeyShare<Bls>> {
         .map_err(|e| anyhow!("invalid secret-key share bytes: {:?}", e))
 }
 
+// ─── DKG bridge (gennaro-dkg → blsful) ─────────────────────────────────────────
+//
+// Genesis (no dealer) and lost-share recovery are done with gennaro-dkg, which is
+// curve-agnostic. We instantiate it over blsful's own blst backend (blstrs_plus) so a
+// participant's raw scalar share drops straight into a blsful `SecretKeyShare` with no
+// re-encoding — the DPRF path above is then identical whether the share came from a
+// dealer split, a distributed DKG, or a reshare. Verified end-to-end (PoC): the bridged
+// share signs/combines to the same σ as a dealer-split share, and reconstructed sk·G
+// equals the DKG group public key.
+
+/// The group gennaro runs over. blsful's `Bls12381G2Impl` puts public keys in G1, so the
+/// DKG group public key lives in G1 and share values are the shared BLS12-381 scalar field.
+pub type DkgGroup = blstrs_plus::G1Projective;
+/// The BLS12-381 scalar field element type — same `Scalar` blsful uses internally (blst).
+pub type DkgScalar = blstrs_plus::Scalar;
+
+/// Bridge a gennaro participant's `(id, secret_share)` output into a blsful `SecretKeyShare`.
+/// `id` is the 1-based on-chain nodeList position (also the Lagrange identifier); `scalar`
+/// is `Participant::get_secret_share()`. The identifier/value types are exactly blsful's
+/// inner share type over the same blstrs_plus `Scalar`, so this is a zero-cost re-wrap.
+pub fn gennaro_share_to_blsful(id: usize, scalar: DkgScalar) -> SecretKeyShare<Bls> {
+    use blsful::vsss_rs::{DefaultShare, IdentifierPrimeField};
+    let identifier = IdentifierPrimeField(DkgScalar::from(id as u64));
+    let value = IdentifierPrimeField(scalar);
+    SecretKeyShare(DefaultShare { identifier, value })
+}
+
 /// Serialize a partial signature (DPRF contribution) for the wire.
 pub fn partial_to_bytes(partial: &SignatureShare<Bls>) -> Vec<u8> {
     Vec::<u8>::from(partial)
@@ -273,5 +300,200 @@ mod tests {
         let privkey: [u8; 32] = signing_key.to_bytes().into();
         let sig = sign_request(&privkey, "GetShardContribution", 1234567890).unwrap();
         assert_eq!(sig.len(), 65);
+    }
+}
+
+// ─── DKG bridge tests (gennaro genesis + reshare recovery → blsful DPRF) ────────
+//
+// Proves in-process that shares produced by a distributed DKG, and shares repaired by a
+// reshare, both drop into the blsful DPRF path and derive the SAME app key as before —
+// i.e. genesis without a dealer, and lost-share recovery, preserve the master. The
+// distributed transport (Phase 2) drives the exact same gennaro rounds over gRPC.
+
+#[cfg(test)]
+mod dkg_tests {
+    use super::*;
+    use blstrs_plus::{G1Projective, Scalar};
+    use ff::Field;
+    use gennaro_dkg::{Parameters, RefreshParticipant, SecretParticipant};
+    use group::Group;
+    use std::collections::BTreeMap;
+    use std::num::NonZeroUsize;
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
+
+    /// App key from a set of (id, scalar-share) via the real DPRF path (bridge + combine).
+    fn app_key(shares: &[(usize, Scalar)], app_id: &str, material: &[u8]) -> [u8; 32] {
+        let msg = dprf_message(app_id, material);
+        let partials: Vec<_> = shares
+            .iter()
+            .map(|(id, s)| dprf_partial(&gennaro_share_to_blsful(*id, *s), &msg).unwrap())
+            .collect();
+        dprf_combine(&partials).unwrap()
+    }
+
+    /// Lagrange interpolation at x=0 over (id, share) points (for the sk·G == pk check).
+    fn lagrange0(points: &[(usize, Scalar)]) -> Scalar {
+        let mut acc = Scalar::ZERO;
+        for (i, (xi, yi)) in points.iter().enumerate() {
+            let xi_s = Scalar::from(*xi as u64);
+            let (mut num, mut den) = (Scalar::ONE, Scalar::ONE);
+            for (j, (xj, _)) in points.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let xj_s = Scalar::from(*xj as u64);
+                num *= xj_s;
+                den *= xj_s - xi_s;
+            }
+            acc += *yi * num * den.invert().unwrap();
+        }
+        acc
+    }
+
+    /// Drive a homogeneous set of SecretParticipants through the 5 DKG rounds in-process.
+    fn drive(ps: &mut [SecretParticipant<G1Projective>]) {
+        let ids: Vec<usize> = ps.iter().map(|p| p.get_id()).collect();
+        let n = ps.len();
+        let (mut b1, mut p2p1) = (Vec::new(), Vec::new());
+        for p in ps.iter_mut() {
+            let (b, p2p) = p.round1().unwrap();
+            b1.push(b);
+            p2p1.push(p2p);
+        }
+        let mut b2 = BTreeMap::new();
+        for i in 0..n {
+            let my = ids[i];
+            let (mut bd, mut pd) = (BTreeMap::new(), BTreeMap::new());
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                bd.insert(ids[j], b1[j].clone());
+                pd.insert(ids[j], p2p1[j][&my].clone());
+            }
+            b2.insert(my, ps[i].round2(bd, pd).unwrap());
+        }
+        let mut b3 = BTreeMap::new();
+        for i in 0..n {
+            b3.insert(ids[i], ps[i].round3(&b2).unwrap());
+        }
+        let mut b4 = BTreeMap::new();
+        for i in 0..n {
+            b4.insert(ids[i], ps[i].round4(&b3).unwrap());
+        }
+        for p in ps.iter_mut() {
+            p.round5(&b4).unwrap();
+        }
+    }
+
+    #[test]
+    fn dkg_genesis_bridges_to_dprf() {
+        // Distributed 2-of-3 genesis (no dealer), then derive via the DPRF path.
+        let params = Parameters::<G1Projective>::new(nz(2), nz(3));
+        let mut ps: Vec<_> = (1..=3)
+            .map(|i| SecretParticipant::<G1Projective>::new(nz(i), params).unwrap())
+            .collect();
+        drive(&mut ps);
+
+        let pk = ps[0].get_public_key().unwrap();
+        assert_eq!(pk, ps[1].get_public_key().unwrap());
+        assert_eq!(pk, ps[2].get_public_key().unwrap());
+
+        let sh: Vec<(usize, Scalar)> = ps
+            .iter()
+            .map(|p| (p.get_id(), p.get_secret_share().unwrap()))
+            .collect();
+        let k_all = app_key(&sh, "app", b"m");
+        assert_eq!(k_all, app_key(&sh[0..2], "app", b"m"), "subset {{1,2}} agrees");
+        assert_eq!(k_all, app_key(&sh[1..3], "app", b"m"), "subset {{2,3}} agrees");
+        assert_ne!(k_all, app_key(&sh, "app", b"other"), "material-bound");
+
+        // The DKG shares lie on a polynomial whose intercept is the master: sk·G == pk.
+        assert_eq!(G1Projective::generator() * lagrange0(&sh[0..2]), pk);
+    }
+
+    #[test]
+    fn dkg_reshare_recovers_lost_share() {
+        // Genesis 2-of-3.
+        let params = Parameters::<G1Projective>::new(nz(2), nz(3));
+        let mut ps: Vec<_> = (1..=3)
+            .map(|i| SecretParticipant::<G1Projective>::new(nz(i), params).unwrap())
+            .collect();
+        drive(&mut ps);
+        let pk0 = ps[0].get_public_key().unwrap();
+        let sh0: Vec<(usize, Scalar)> = ps
+            .iter()
+            .map(|p| (p.get_id(), p.get_secret_share().unwrap()))
+            .collect();
+        let k0 = app_key(&sh0, "app", b"m");
+
+        // Node 3 lost its share. Survivors {1,2} reshare (with_secret preserves the master);
+        // node 3 rejoins as a RefreshParticipant (contributes 0) and comes out with a share.
+        let rp = Parameters::<G1Projective>::new(nz(2), nz(3));
+        let dealer_ids = [Scalar::from(1u64), Scalar::from(2u64)];
+        let mut d1 =
+            SecretParticipant::<G1Projective>::with_secret(nz(1), rp, sh0[0].1, &dealer_ids, 0)
+                .unwrap();
+        let mut d2 =
+            SecretParticipant::<G1Projective>::with_secret(nz(2), rp, sh0[1].1, &dealer_ids, 1)
+                .unwrap();
+        let mut r3 = RefreshParticipant::<G1Projective>::new(nz(3), rp).unwrap();
+
+        // Round 1 (broadcast + p2p; round-data types are parameterised by the group only,
+        // so SecretParticipant and RefreshParticipant outputs share a type and mix freely).
+        let (b1, p1) = d1.round1().unwrap();
+        let (b2, p2) = d2.round1().unwrap();
+        let (b3, p3) = r3.round1().unwrap();
+
+        // Round 2.
+        let r2_1 = d1
+            .round2(
+                BTreeMap::from([(2, b2.clone()), (3, b3.clone())]),
+                BTreeMap::from([(2, p2[&1].clone()), (3, p3[&1].clone())]),
+            )
+            .unwrap();
+        let r2_2 = d2
+            .round2(
+                BTreeMap::from([(1, b1.clone()), (3, b3.clone())]),
+                BTreeMap::from([(1, p1[&2].clone()), (3, p3[&2].clone())]),
+            )
+            .unwrap();
+        let r2_3 = r3
+            .round2(
+                BTreeMap::from([(1, b1.clone()), (2, b2.clone())]),
+                BTreeMap::from([(1, p1[&3].clone()), (2, p2[&3].clone())]),
+            )
+            .unwrap();
+
+        // Rounds 3–5 take the full map of the previous round's broadcasts (incl. self).
+        let b2map = BTreeMap::from([(1, r2_1), (2, r2_2), (3, r2_3)]);
+        let b3map = BTreeMap::from([
+            (1, d1.round3(&b2map).unwrap()),
+            (2, d2.round3(&b2map).unwrap()),
+            (3, r3.round3(&b2map).unwrap()),
+        ]);
+        let b4map = BTreeMap::from([
+            (1, d1.round4(&b3map).unwrap()),
+            (2, d2.round4(&b3map).unwrap()),
+            (3, r3.round4(&b3map).unwrap()),
+        ]);
+        d1.round5(&b4map).unwrap();
+        d2.round5(&b4map).unwrap();
+        r3.round5(&b4map).unwrap();
+
+        // Master (group pubkey) is unchanged, and node 3 has a fresh, consistent share.
+        assert_eq!(r3.get_public_key().unwrap(), pk0, "reshare must preserve the master");
+        let sh_new = [
+            (1, d1.get_secret_share().unwrap()),
+            (2, d2.get_secret_share().unwrap()),
+            (3, r3.get_secret_share().unwrap()),
+        ];
+        assert_eq!(app_key(&sh_new, "app", b"m"), k0, "recovered committee derives same key");
+        // NOTE: reshare refreshes the WHOLE committee onto a new polynomial f' (f'(0) still
+        // = master). Survivors' shares change too, so an ORIGINAL share must NOT be mixed
+        // with reshared ones — Phase 4 must persist every participant's new share.
     }
 }
