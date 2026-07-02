@@ -306,19 +306,29 @@ pub async fn collect_and_dprf(
     let mut seen = std::collections::HashSet::new();
     collected.retain(|(idx, _)| seen.insert(*idx));
 
-    if collected.len() < state.config.cluster.threshold as usize {
+    // Parse partials best-effort: a peer whose gRPC call and ECIES decrypt succeed can still
+    // return an empty/malformed payload. Discard those individually (rather than aborting the
+    // whole derivation) so a single faulty node cannot deny service — the threshold model is
+    // supposed to tolerate up to n - threshold bad nodes. The count check below uses only the
+    // partials that actually parsed.
+    let partials: Vec<_> = collected
+        .iter()
+        .filter_map(|(idx, bytes)| match partial_from_bytes(bytes) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(shard_index = idx, error = %e, "discarding malformed partial");
+                None
+            }
+        })
+        .collect();
+
+    if partials.len() < state.config.cluster.threshold as usize {
         return Err(KmsError::CryptoError(format!(
-            "not enough partials: got {}, need {}",
-            collected.len(),
+            "not enough valid partials: got {}, need {}",
+            partials.len(),
             state.config.cluster.threshold
         )));
     }
-
-    let partials = collected
-        .iter()
-        .map(|(_, bytes)| partial_from_bytes(bytes))
-        .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(|e| KmsError::CryptoError(e.to_string()))?;
 
     dprf_combine(&partials).map_err(|e| KmsError::CryptoError(e.to_string()))
 }
