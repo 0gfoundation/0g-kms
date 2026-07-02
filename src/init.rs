@@ -46,15 +46,37 @@ pub async fn init_start_node(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of a join attempt. Distinguishes "no peer reachable" (possibly a genuine
+/// first-ever cluster start) from "a peer answered but wouldn't give us a shard" (the
+/// cluster already exists) — the disaster gate in `main` relies on this: a node must NEVER
+/// regenerate a fresh master when the cluster is already up.
+pub enum JoinResult {
+    /// Got our shard from a seed and stored it.
+    Joined,
+    /// No seed was reachable at the connection level (all connects failed).
+    NoSeedReachable,
+    /// At least one seed was reachable but declined/failed to serve a shard (e.g. recovery
+    /// not yet available). The cluster exists → regenerating a master would fork it.
+    SeedReachableDeclined,
+}
+
+/// Per-seed failure, split by whether the peer was reachable (RPC-level) or not
+/// (connection-level). Only "all unreachable" may lead to genesis.
+enum SeedError {
+    Unreachable(anyhow::Error),
+    Declined(anyhow::Error),
+}
+
 /// Join flow (non-bootstrap node, or restarted node):
-///   1. Pick a seed from config.cluster.seeds.
-///   2. Call RequestShard via gRPC.
-///   3. Decrypt the response.
-///   4. Store own shard.
-pub async fn join_cluster(state: &AppState) -> Result<()> {
+///   1. For each seed: call RequestShard via gRPC, decrypt, store own shard.
+///   2. Classify the outcome (see [`JoinResult`]).
+/// Returns `Err` only on genuine local errors (e.g. signing) — never conflated with
+/// reachability, so the caller never genesis-es on an internal error.
+pub async fn join_cluster(state: &AppState) -> Result<JoinResult> {
     let seeds = &state.config.cluster.seeds;
     if seeds.is_empty() {
-        return Err(anyhow!("no seeds configured — cannot join cluster"));
+        info!("no seeds configured — treating as empty cluster (eligible for genesis)");
+        return Ok(JoinResult::NoSeedReachable);
     }
 
     info!(seeds = ?seeds, "Joining cluster — requesting shard from seeds");
@@ -62,26 +84,29 @@ pub async fn join_cluster(state: &AppState) -> Result<()> {
     let timestamp = chrono::Utc::now().timestamp();
     let sig = sign_request(&state.signing_key.private_key, "RequestShard", timestamp)?;
 
-    let mut last_err = anyhow!("all seeds failed");
+    let mut any_reachable = false;
     for seed_url in seeds {
         match request_shard_from_peer(seed_url, &sig, timestamp, state).await {
             Ok(shard) => {
-                info!(
-                    peer = %seed_url,
-                    shard_index = shard.shard_index,
-                    "Shard received and stored"
-                );
+                info!(peer = %seed_url, shard_index = shard.shard_index, "Shard received and stored");
                 *state.shard.write().await = Some(shard);
-                return Ok(());
+                return Ok(JoinResult::Joined);
             }
-            Err(e) => {
-                tracing::warn!(peer = %seed_url, error = %e, "RequestShard failed");
-                last_err = e;
+            Err(SeedError::Unreachable(e)) => {
+                tracing::warn!(peer = %seed_url, error = %e, "seed unreachable");
+            }
+            Err(SeedError::Declined(e)) => {
+                any_reachable = true;
+                tracing::warn!(peer = %seed_url, error = %e, "seed reachable but declined shard");
             }
         }
     }
 
-    Err(last_err)
+    Ok(if any_reachable {
+        JoinResult::SeedReachableDeclined
+    } else {
+        JoinResult::NoSeedReachable
+    })
 }
 
 async fn request_shard_from_peer(
@@ -89,7 +114,7 @@ async fn request_shard_from_peer(
     sig: &[u8],
     timestamp: i64,
     state: &AppState,
-) -> Result<ShardState> {
+) -> std::result::Result<ShardState, SeedError> {
     use tonic::metadata::MetadataValue;
     use tonic::transport::Channel;
 
@@ -98,31 +123,50 @@ async fn request_shard_from_peer(
     }
     use proto::kms_cluster_client::KmsClusterClient;
 
-    let channel = Channel::from_shared(peer_url.to_string())?
+    // Connection-level failures (bad URL, connect refused/timeout) = Unreachable: the peer
+    // may simply not be up yet, so this alone may indicate a genuine first-cluster start.
+    let channel = Channel::from_shared(peer_url.to_string())
+        .map_err(|e| SeedError::Unreachable(anyhow!("bad seed url {}: {}", peer_url, e)))?
         .connect()
         .await
-        .map_err(|e| anyhow!("cannot connect to {}: {}", peer_url, e))?;
+        .map_err(|e| SeedError::Unreachable(anyhow!("cannot connect to {}: {}", peer_url, e)))?;
 
+    // From here the peer IS reachable: any further failure is Declined (the cluster exists),
+    // which must never be mistaken for "empty cluster" and never trigger master regeneration.
     let mut client = KmsClusterClient::new(channel);
 
     let mut request = tonic::Request::new(());
     request.metadata_mut().insert(
         "signature",
-        MetadataValue::try_from(hex::encode(sig))?,
+        MetadataValue::try_from(hex::encode(sig))
+            .map_err(|e| SeedError::Declined(anyhow!("bad signature metadata: {}", e)))?,
     );
     request.metadata_mut().insert(
         "timestamp",
-        MetadataValue::try_from(timestamp.to_string())?,
+        MetadataValue::try_from(timestamp.to_string())
+            .map_err(|e| SeedError::Declined(anyhow!("bad timestamp metadata: {}", e)))?,
     );
 
     let resp = client
         .request_shard(request)
         .await
-        .map_err(|e| anyhow!("RequestShard RPC failed: {}", e))?
+        .map_err(|status| {
+            // FailedPrecondition = the peer is an initialized cluster member (cluster exists)
+            // → Declined, so the disaster gate refuses genesis. Unavailable = peer not
+            // initialized (or transiently down) → Unreachable, not evidence of a cluster.
+            let msg = anyhow!("RequestShard on {}: {}", peer_url, status.message());
+            match status.code() {
+                tonic::Code::Unavailable => SeedError::Unreachable(msg),
+                tonic::Code::FailedPrecondition => SeedError::Declined(msg),
+                // Any other reachable-peer error: be conservative and treat the cluster as
+                // existing (Declined) — never risk regenerating a master.
+                _ => SeedError::Declined(msg),
+            }
+        })?
         .into_inner();
 
     let shard_bytes = ecies_decrypt(&state.signing_key.private_key, &resp.ciphertext)
-        .map_err(|e| anyhow!("ECIES decrypt failed: {}", e))?;
+        .map_err(|e| SeedError::Declined(anyhow!("ECIES decrypt failed: {}", e)))?;
 
     Ok(ShardState {
         shard_index: resp.shard_index,
