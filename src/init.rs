@@ -265,8 +265,9 @@ async fn run_genesis(
         shard_index: own_id,
         shard_bytes: share_to_bytes(&sk_share),
     });
-    *state.group_pubkey.write().await = Some(pk.to_bytes().as_ref().to_vec());
-    info!(own_id, "genesis DKG complete — share and group public key stored");
+    let pk_bytes = pk.to_bytes().as_ref().to_vec();
+    *state.group_pubkey.write().await = Some(pk_bytes.clone());
+    info!(own_id, group_pubkey = %hex::encode(&pk_bytes), "genesis DKG complete — share and group public key stored");
     Ok(())
 }
 
@@ -317,8 +318,9 @@ async fn run_reshare_recovery(
         shard_index: own_id,
         shard_bytes: share_to_bytes(&sk_share),
     });
-    *state.group_pubkey.write().await = Some(pk.to_bytes().as_ref().to_vec());
-    info!(own_id, "reshare recovery complete — share repaired, master preserved");
+    let pk_bytes = pk.to_bytes().as_ref().to_vec();
+    *state.group_pubkey.write().await = Some(pk_bytes.clone());
+    info!(own_id, group_pubkey = %hex::encode(&pk_bytes), "reshare recovery complete — share repaired, master preserved");
     Ok(())
 }
 
@@ -382,7 +384,7 @@ pub async fn run_reshare_dealer(
         shard_index: own_id,
         shard_bytes: share_to_bytes(&sk_share),
     });
-    info!(own_id, "reshare dealer complete — share refreshed, master preserved");
+    info!(own_id, group_pubkey = %hex::encode(&new_pk_bytes), "reshare dealer complete — share refreshed, master preserved");
     Ok(())
 }
 
