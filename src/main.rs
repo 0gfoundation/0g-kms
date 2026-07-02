@@ -2,6 +2,7 @@ mod auth;
 mod chain;
 mod config;
 mod crypto;
+mod dkg;
 mod error;
 mod grpc;
 mod init;
