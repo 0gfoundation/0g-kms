@@ -220,10 +220,25 @@ pub async fn handle_app_key(
     ))
 }
 
+/// Trigger a proactive refresh of the whole committee's shares (master preserved, old
+/// shares expire). Admin/ops operation.
+/// NOTE: unauthenticated here for the local test harness — production must gate this
+/// (operator auth / on-chain policy) since it forces a cluster-wide reshare.
+pub async fn handle_refresh(State(state): State<AppState>) -> impl IntoResponse {
+    match crate::init::trigger_refresh(&state).await {
+        Ok(()) => (StatusCode::OK, "refresh complete".to_string()),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("refresh failed: {}", e),
+        ),
+    }
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/app-key", axum::routing::post(handle_app_key))
+        .route("/refresh", axum::routing::post(handle_refresh))
         .with_state(state)
 }
