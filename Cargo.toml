@@ -52,6 +52,12 @@ vsss-rs = "5.1.0"
 # lineage as blsful/vsss-rs). Produces scalar shares that bridge into blsful SecretKeyShare.
 # Genesis DKG (no dealer single point) + lost-share recovery/refresh via resharing.
 gennaro-dkg = "0.8.0"
+# blsful's blst backend curve types (Scalar/G1Projective), named directly so we can bridge
+# a gennaro scalar share into a blsful SecretKeyShare. Unifies with blsful's blstrs_plus.
+blstrs_plus = "0.8"
+# Curve traits (Group/GroupEncoding/PrimeField) used to drive gennaro over blstrs_plus.
+group = "0.13"
+ff = "0.13"
 
 # On-chain lookup (ethers for reading contract state)
 ethers = { version = "2.0", default-features = false, features = ["rustls", "abigen"] }
