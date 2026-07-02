@@ -58,6 +58,8 @@ blstrs_plus = "0.8"
 # Curve traits (Group/GroupEncoding/PrimeField) used to drive gennaro over blstrs_plus.
 group = "0.13"
 ff = "0.13"
+# Canonical serialization of gennaro DKG round messages for the wire (same codec blsful uses).
+serde_bare = "0.5"
 
 # On-chain lookup (ethers for reading contract state)
 ethers = { version = "2.0", default-features = false, features = ["rustls", "abigen"] }
