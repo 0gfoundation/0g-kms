@@ -126,6 +126,12 @@ pub fn gennaro_share_to_blsful(id: usize, scalar: DkgScalar) -> SecretKeyShare<B
     SecretKeyShare(DefaultShare { identifier, value })
 }
 
+/// Extract the raw scalar value from a blsful secret-key share (inverse of the bridge), so
+/// a genesis/DKG share can be fed back into a gennaro reshare as a dealer's secret.
+pub fn blsful_share_scalar(share: &SecretKeyShare<Bls>) -> DkgScalar {
+    share.0.value.0
+}
+
 /// This node's own uncompressed secp256k1 public key (65 bytes, 0x04-prefixed) from its
 /// private key. Gossiped to peers so they can ECIES-encrypt DKG round-1 p2p shares to us
 /// (peer_table otherwise only knows the eth_addr, a hash from which the pubkey can't be

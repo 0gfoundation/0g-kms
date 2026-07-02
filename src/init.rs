@@ -2,13 +2,16 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use gennaro_dkg::{Parameters, SecretParticipant};
+use gennaro_dkg::{Parameters, RefreshParticipant, SecretParticipant};
 use group::GroupEncoding;
 use tracing::info;
 
 use crate::{
     chain::get_signer_addresses,
-    crypto::{ecies_decrypt, gennaro_share_to_blsful, share_to_bytes, sign_request, split_master, DkgGroup},
+    crypto::{
+        blsful_share_scalar, ecies_decrypt, gennaro_share_to_blsful, share_from_bytes,
+        share_to_bytes, sign_request, split_master, DkgGroup, DkgScalar,
+    },
     dkg::{run_session, SessionPeer},
     server::{AppState, ShardState},
 };
@@ -267,6 +270,122 @@ async fn run_genesis(
     Ok(())
 }
 
+/// Recovering-node side of reshare recovery: trigger the live committee to reshare and
+/// rejoin as a `RefreshParticipant`, coming out with a fresh, consistent share of the same
+/// master. The survivors act as dealers (see `run_reshare_dealer`); the master is preserved.
+async fn run_reshare_recovery(
+    state: &AppState,
+    own_id: u32,
+    peers: Vec<SessionPeer>,
+    threshold: usize,
+    total: usize,
+) -> Result<()> {
+    let epoch = chrono::Utc::now().timestamp();
+    let session_id = format!("reshare:{}:{}", state.config.tapp.app_id, epoch);
+    let mut dealer_ids: Vec<u32> = peers.iter().map(|p| p.id).collect();
+    dealer_ids.sort_unstable();
+
+    // Trigger each survivor to participate as a dealer.
+    let ts = chrono::Utc::now().timestamp();
+    let sig = sign_request(&state.signing_key.private_key, "StartReshare", ts)?;
+    for peer in &peers {
+        if let Err(e) = crate::grpc::send_start_reshare(
+            &peer.grpc_url,
+            &session_id,
+            own_id,
+            dealer_ids.clone(),
+            &sig,
+            ts,
+        )
+        .await
+        {
+            tracing::warn!(peer = %peer.grpc_url, error = %e, "failed to trigger reshare dealer");
+        }
+    }
+
+    let params = Parameters::<DkgGroup>::new(
+        NonZeroUsize::new(threshold).ok_or_else(|| anyhow!("threshold must be > 0"))?,
+        NonZeroUsize::new(total).ok_or_else(|| anyhow!("total_nodes must be > 0"))?,
+    );
+    let participant =
+        RefreshParticipant::<DkgGroup>::new(NonZeroUsize::new(own_id as usize).unwrap(), params)
+            .map_err(|e| anyhow!("reshare (recovering) participant init: {:?}", e))?;
+
+    let (share, pk) = run_session(state, &session_id, participant, &peers, DKG_ROUND_TIMEOUT).await?;
+    let sk_share = gennaro_share_to_blsful(own_id as usize, share);
+    *state.shard.write().await = Some(ShardState {
+        shard_index: own_id,
+        shard_bytes: share_to_bytes(&sk_share),
+    });
+    *state.group_pubkey.write().await = Some(pk.to_bytes().as_ref().to_vec());
+    info!(own_id, "reshare recovery complete — share repaired, master preserved");
+    Ok(())
+}
+
+/// Dealer side of a reshare, invoked from the `StartReshare` RPC handler on a live committee
+/// member. Contributes our existing share (so the polynomial's intercept — the master —
+/// is preserved) and replaces our stored share with the refreshed one. Refuses to update if
+/// the reshare would change the group public key.
+pub async fn run_reshare_dealer(
+    state: &AppState,
+    session_id: String,
+    dealer_ids: Vec<u32>,
+) -> Result<()> {
+    let (own_id, peers, threshold, total) = assemble_participants(state)
+        .await?
+        .ok_or_else(|| anyhow!("reshare dealer: full cluster membership not available"))?;
+
+    let own_share_bytes = state
+        .shard
+        .read()
+        .await
+        .as_ref()
+        .ok_or_else(|| anyhow!("reshare dealer: no local share"))?
+        .shard_bytes
+        .clone();
+    let own_scalar = blsful_share_scalar(&share_from_bytes(&own_share_bytes)?);
+
+    let dealer_scalars: Vec<DkgScalar> =
+        dealer_ids.iter().map(|id| DkgScalar::from(*id as u64)).collect();
+    let own_index = dealer_ids
+        .iter()
+        .position(|id| *id == own_id)
+        .ok_or_else(|| anyhow!("reshare dealer: own id {} not in dealer set", own_id))?;
+
+    let params = Parameters::<DkgGroup>::new(
+        NonZeroUsize::new(threshold).ok_or_else(|| anyhow!("threshold must be > 0"))?,
+        NonZeroUsize::new(total).ok_or_else(|| anyhow!("total_nodes must be > 0"))?,
+    );
+    let participant = SecretParticipant::<DkgGroup>::with_secret(
+        NonZeroUsize::new(own_id as usize).unwrap(),
+        params,
+        own_scalar,
+        &dealer_scalars,
+        own_index,
+    )
+    .map_err(|e| anyhow!("reshare dealer participant init: {:?}", e))?;
+
+    let (new_share, new_pk) =
+        run_session(state, &session_id, participant, &peers, DKG_ROUND_TIMEOUT).await?;
+
+    // Master must be preserved: refuse to replace our share if the group pubkey changed.
+    let new_pk_bytes = new_pk.to_bytes().as_ref().to_vec();
+    if let Some(old) = state.group_pubkey.read().await.as_ref() {
+        if *old != new_pk_bytes {
+            return Err(anyhow!(
+                "reshare changed the group public key — aborting share update to avoid corruption"
+            ));
+        }
+    }
+    let sk_share = gennaro_share_to_blsful(own_id as usize, new_share);
+    *state.shard.write().await = Some(ShardState {
+        shard_index: own_id,
+        shard_bytes: share_to_bytes(&sk_share),
+    });
+    info!(own_id, "reshare dealer complete — share refreshed, master preserved");
+    Ok(())
+}
+
 /// Background cluster formation, run once after the servers + gossip start.
 ///
 /// 1. Wait for full membership (all nodeList members discovered via gossip, with pubkeys).
@@ -304,12 +423,12 @@ pub async fn form_cluster(state: AppState) {
             }
         }
         Ok(JoinResult::SeedReachableDeclined) => {
-            // Established cluster, we have no shard. Recover via reshare (Phase 4).
-            tracing::error!(
-                "cluster is already established but this node has no shard; reshare-based \
-                 recovery is not yet implemented (Phase 4). Refusing to regenerate a master."
-            );
-            // TODO(Phase 4): run reshare recovery to repair our share.
+            // Established cluster, we have no shard → recover our share via reshare from the
+            // live committee (never regenerate a master).
+            info!(own_id, "cluster established — recovering our share via reshare");
+            if let Err(e) = run_reshare_recovery(&state, own_id, peers, threshold, total).await {
+                tracing::error!(error = %e, "reshare recovery failed — this node stays without a shard");
+            }
         }
         Err(e) => tracing::error!(error = %e, "cluster probe failed; not forming a key"),
     }
