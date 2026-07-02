@@ -20,7 +20,7 @@ mod proto {
 use proto::{
     kms_cluster_server::{KmsCluster, KmsClusterServer},
     DkgRoundAck, DkgRoundMsg, DprfPartialRequest, EncryptedPartial, EncryptedShard, GossipRequest,
-    GossipResponse, NodeInfo,
+    GossipResponse, NodeInfo, ReshareAck, ReshareRequest,
 };
 
 pub fn service(state: AppState) -> KmsClusterServer<KmsClusterService> {
@@ -196,6 +196,35 @@ impl KmsCluster for KmsClusterService {
 
         Ok(Response::new(DkgRoundAck {}))
     }
+
+    /// Reshare trigger: a recovering node asks us (a live committee member holding a share)
+    /// to participate as a dealer. We run the reshare in the background and replace our own
+    /// share with the refreshed one; the master (group pubkey) is preserved.
+    async fn start_reshare(
+        &self,
+        request: Request<ReshareRequest>,
+    ) -> Result<Response<ReshareAck>, Status> {
+        let _ctx = authenticate(request.metadata(), "StartReshare", &self.state.config).await?;
+        let req = request.into_inner();
+
+        // We can only deal if we hold a share.
+        if self.state.shard.read().await.is_none() {
+            return Err(Status::failed_precondition("no local share to reshare"));
+        }
+
+        // Run the dealer side in the background so we can ack promptly; the session
+        // synchronises with the recovering node + other dealers via the DkgRound barrier.
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::init::run_reshare_dealer(&state, req.session_id, req.dealer_ids).await
+            {
+                tracing::error!(error = %e, "reshare dealer session failed");
+            }
+        });
+
+        Ok(Response::new(ReshareAck {}))
+    }
 }
 
 impl KmsClusterService {
@@ -333,6 +362,37 @@ pub async fn send_dkg_round(
         .insert("timestamp", MetadataValue::try_from(timestamp.to_string())?);
 
     client.dkg_round(request).await?;
+    Ok(())
+}
+
+/// Ask a live committee member (`peer_url`) to join a reshare as a dealer.
+pub async fn send_start_reshare(
+    peer_url: &str,
+    session_id: &str,
+    recovering_id: u32,
+    dealer_ids: Vec<u32>,
+    sig: &[u8],
+    timestamp: i64,
+) -> anyhow::Result<()> {
+    use tonic::metadata::MetadataValue;
+    use tonic::transport::Channel;
+
+    let channel = Channel::from_shared(peer_url.to_string())?.connect().await?;
+    let mut client = proto::kms_cluster_client::KmsClusterClient::new(channel);
+
+    let mut request = Request::new(ReshareRequest {
+        session_id: session_id.to_string(),
+        recovering_id,
+        dealer_ids,
+    });
+    request
+        .metadata_mut()
+        .insert("signature", MetadataValue::try_from(hex::encode(sig))?);
+    request
+        .metadata_mut()
+        .insert("timestamp", MetadataValue::try_from(timestamp.to_string())?);
+
+    client.start_reshare(request).await?;
     Ok(())
 }
 

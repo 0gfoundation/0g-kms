@@ -44,6 +44,12 @@ service KmsCluster {
   // participants' round-N messages. Genesis (no dealer) and lost-share recovery (reshare)
   // run the same gennaro rounds — session_id namespaces the instance.
   rpc DkgRound(DkgRoundMsg) returns (DkgRoundAck);
+
+  // Reshare trigger: a recovering node (which lost its share) asks a live committee member
+  // to participate in a reshare session as a dealer, contributing its existing share so the
+  // master is preserved. The recipient runs the session in the background and replaces its
+  // own share with the refreshed one. Idempotent per session_id.
+  rpc StartReshare(ReshareRequest) returns (ReshareAck);
 }
 
 // ─── DPRF messages ────────────────────────────────────────────────────────────
@@ -92,3 +98,11 @@ message DkgRoundMsg {
 }
 
 message DkgRoundAck {}
+
+message ReshareRequest {
+  string session_id     = 1;  // "reshare:{app_id}:{epoch}"
+  uint32 recovering_id  = 2;  // participant id of the node being recovered
+  repeated uint32 dealer_ids = 3;  // ids of the dealers (survivors contributing shares), in order
+}
+
+message ReshareAck {}
