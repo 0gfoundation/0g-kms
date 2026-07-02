@@ -33,6 +33,27 @@ pub struct ShardState {
     pub shard_bytes: Vec<u8>,
 }
 
+/// Inbound round messages for one DKG/reshare session, buffered until the driver consumes
+/// them. `rounds[round][from_index] = (broadcast_bytes, decrypted_p2p_bytes)`. The `notify`
+/// wakes the session driver each time a new round message arrives so it can re-check its
+/// per-round barrier.
+#[derive(Default)]
+pub struct DkgSession {
+    pub rounds: HashMap<u32, HashMap<u32, (Vec<u8>, Vec<u8>)>>,
+    pub notify: Arc<tokio::sync::Notify>,
+}
+
+impl DkgSession {
+    /// Store a received round message and wake any waiting driver.
+    pub fn record(&mut self, round: u32, from_index: u32, broadcast: Vec<u8>, p2p: Vec<u8>) {
+        self.rounds
+            .entry(round)
+            .or_default()
+            .insert(from_index, (broadcast, p2p));
+        self.notify.notify_waiters();
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -43,6 +64,8 @@ pub struct AppState {
     pub pending_shards: Arc<RwLock<Option<Vec<(u32, Vec<u8>)>>>>,
     /// Dynamic peer table maintained by gossip: eth_addr → PeerInfo.
     pub peer_table: Arc<RwLock<HashMap<[u8; 20], PeerInfo>>>,
+    /// In-flight DKG/reshare sessions: session_id → buffered inbound round messages.
+    pub dkg_sessions: Arc<RwLock<HashMap<String, DkgSession>>>,
 }
 
 impl AppState {
@@ -53,6 +76,7 @@ impl AppState {
             shard: Arc::new(RwLock::new(None)),
             pending_shards: Arc::new(RwLock::new(None)),
             peer_table: Arc::new(RwLock::new(HashMap::new())),
+            dkg_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

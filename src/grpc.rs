@@ -19,7 +19,8 @@ mod proto {
 
 use proto::{
     kms_cluster_server::{KmsCluster, KmsClusterServer},
-    DprfPartialRequest, EncryptedPartial, EncryptedShard, GossipRequest, GossipResponse, NodeInfo,
+    DkgRoundAck, DkgRoundMsg, DprfPartialRequest, EncryptedPartial, EncryptedShard, GossipRequest,
+    GossipResponse, NodeInfo,
 };
 
 pub fn service(state: AppState) -> KmsClusterServer<KmsClusterService> {
@@ -160,6 +161,37 @@ impl KmsCluster for KmsClusterService {
 
         Ok(Response::new(GossipResponse { peers }))
     }
+
+    /// DKG/reshare transport: buffer an inbound round message for the session driver.
+    /// The round-1 p2p payload is ECIES-encrypted to us; decrypt it before buffering.
+    /// The broadcast is stored as-is (it's public commitment data verified inside gennaro).
+    async fn dkg_round(
+        &self,
+        request: Request<DkgRoundMsg>,
+    ) -> Result<Response<DkgRoundAck>, Status> {
+        // Authenticate: sender must be a current on-chain node. (Hardening TODO: bind
+        // msg.from_index to the caller's nodeList position; gennaro's per-round commitment
+        // checks already reject a message routed under the wrong identity.)
+        let _ctx = authenticate(request.metadata(), "DkgRound", &self.state.config).await?;
+        let msg = request.into_inner();
+
+        let p2p = if msg.p2p.is_empty() {
+            Vec::new()
+        } else {
+            ecies_decrypt(&self.state.signing_key.private_key, &msg.p2p)
+                .map_err(|e| Status::internal(format!("dkg p2p decrypt failed: {}", e)))?
+        };
+
+        self.state
+            .dkg_sessions
+            .write()
+            .await
+            .entry(msg.session_id)
+            .or_default()
+            .record(msg.round, msg.from_index, msg.broadcast, p2p);
+
+        Ok(Response::new(DkgRoundAck {}))
+    }
 }
 
 impl KmsClusterService {
@@ -261,6 +293,43 @@ pub async fn get_dprf_partial(
         .map_err(|e| anyhow::anyhow!("ECIES decrypt failed: {}", e))?;
 
     Ok((resp.shard_index, partial_bytes))
+}
+
+/// Deliver one DKG/reshare round message to a peer (fire-and-forget beyond the ack).
+/// `broadcast` is public; `p2p` (round 1 only) must already be ECIES-encrypted for the
+/// recipient by the caller (the driver knows each peer's pubkey).
+pub async fn send_dkg_round(
+    peer_url: &str,
+    session_id: &str,
+    round: u32,
+    from_index: u32,
+    broadcast: Vec<u8>,
+    p2p: Vec<u8>,
+    sig: &[u8],
+    timestamp: i64,
+) -> anyhow::Result<()> {
+    use tonic::metadata::MetadataValue;
+    use tonic::transport::Channel;
+
+    let channel = Channel::from_shared(peer_url.to_string())?.connect().await?;
+    let mut client = proto::kms_cluster_client::KmsClusterClient::new(channel);
+
+    let mut request = Request::new(DkgRoundMsg {
+        session_id: session_id.to_string(),
+        round,
+        from_index,
+        broadcast,
+        p2p,
+    });
+    request
+        .metadata_mut()
+        .insert("signature", MetadataValue::try_from(hex::encode(sig))?);
+    request
+        .metadata_mut()
+        .insert("timestamp", MetadataValue::try_from(timestamp.to_string())?);
+
+    client.dkg_round(request).await?;
+    Ok(())
 }
 
 // ─── Concurrent collect helper (used by server.rs /app-key handler) ───────────
