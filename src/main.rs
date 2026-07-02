@@ -39,40 +39,14 @@ async fn main() -> Result<()> {
 
     let state = server::AppState::new(config.clone(), signing_key);
 
-    // Bootstrap node: try to join first (handles restarts gracefully).
-    // DISASTER GATE: only create a fresh master when NO peer is reachable (a genuine
-    // first-ever cluster start). If a peer is reachable but couldn't serve our shard, the
-    // cluster already exists — regenerating a master would fork it and lose every derived
-    // key, so we refuse and stay down until we can recover the shard (Phase 4 reshare).
-    // Non-bootstrap nodes always join and fail hard if they can't.
-    use init::JoinResult;
-    if config.cluster.bootstrap {
-        match init::join_cluster(&state).await? {
-            JoinResult::Joined => info!("Rejoined existing cluster"),
-            JoinResult::NoSeedReachable => {
-                info!("No existing cluster reachable — bootstrapping as first node");
-                init::init_start_node(&state)
-                    .await
-                    .context("Bootstrap initialization failed")?;
-            }
-            JoinResult::SeedReachableDeclined => {
-                anyhow::bail!(
-                    "a cluster peer is reachable but could not serve our shard; refusing to \
-                     regenerate a master (that would fork the cluster and lose all derived \
-                     keys). This node stays down until it can recover its shard via reshare \
-                     (Phase 4) or a peer serves it."
-                );
-            }
-        }
-    } else {
-        match init::join_cluster(&state).await? {
-            JoinResult::Joined => {}
-            _ => anyhow::bail!("failed to join cluster: no seed served our shard"),
-        }
-    }
-
-    // Start gossip background task (peer discovery + liveness)
+    // Start gossip so nodes discover each other, then form the cluster key in the background:
+    // distributed genesis DKG (fresh cluster) or reshare recovery (established cluster). This
+    // needs the gRPC server up (nodes exchange DkgRound messages) and gossip converged, so it
+    // runs AFTER the servers start — `state.shard` stays None (and /app-key returns not-ready)
+    // until formation completes. The disaster gate lives in form_cluster: an established
+    // cluster never triggers genesis, so a restarted node can't silently mint a new master.
     grpc::start_gossip_task(state.clone());
+    tokio::spawn(init::form_cluster(state.clone()));
 
     let http_addr = config.server.bind.clone();
     let grpc_addr = config.server.grpc_bind.clone();

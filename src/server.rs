@@ -69,6 +69,9 @@ pub struct AppState {
     pub peer_table: Arc<RwLock<HashMap<[u8; 20], PeerInfo>>>,
     /// In-flight DKG/reshare sessions: session_id → buffered inbound round messages.
     pub dkg_sessions: Arc<RwLock<HashMap<String, DkgSession>>>,
+    /// The cluster's group public key (G1), set after genesis DKG. Serves as the
+    /// "genesis has happened" witness and is checked when recovering a share via reshare.
+    pub group_pubkey: Arc<RwLock<Option<Vec<u8>>>>,
 }
 
 impl AppState {
@@ -80,6 +83,7 @@ impl AppState {
             pending_shards: Arc::new(RwLock::new(None)),
             peer_table: Arc::new(RwLock::new(HashMap::new())),
             dkg_sessions: Arc::new(RwLock::new(HashMap::new())),
+            group_pubkey: Arc::new(RwLock::new(None)),
         }
     }
 
