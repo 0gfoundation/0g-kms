@@ -1,0 +1,23 @@
+# [0g-kms fork of uint-zigzag 0.2.1]
+# Upstream 0.2.1 depends on `core2 = "^0.4"`, but the only version in that range
+# (core2 0.4.0) is YANKED, so a fresh resolve of gennaro-dkg 0.8.0 fails. This vendored
+# copy is std-only and drops core2 (uses std::io instead). Version kept at 0.2.1 so it
+# satisfies gennaro-dkg's `uint-zigzag ^0.2.1` requirement via [patch.crates-io].
+[package]
+edition = "2021"
+name = "uint-zigzag"
+version = "0.2.1"
+authors = ["Michael Lodder <redmike7@gmail.com>"]
+description = "Zig-zag varint encoding (0g-kms std-only fork, core2 dependency removed)"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/mikelodder7/uint"
+
+[dependencies.serde]
+version = "1"
+features = ["serde_derive"]
+optional = true
+
+[features]
+default = ["std"]
+alloc = []
+std = []

@@ -48,6 +48,10 @@ blsful = "=3.1.0"
 # Shamir/VSS primitives (share repair on the recovery path). Aligned with blsful's vsss-rs;
 # also re-exported as `blsful::vsss_rs` to avoid version skew.
 vsss-rs = "5.1.0"
+# Distributed key generation + proactive resharing (Family A: mikelodder7 stack, same
+# lineage as blsful/vsss-rs). Produces scalar shares that bridge into blsful SecretKeyShare.
+# Genesis DKG (no dealer single point) + lost-share recovery/refresh via resharing.
+gennaro-dkg = "0.8.0"
 
 # On-chain lookup (ethers for reading contract state)
 ethers = { version = "2.0", default-features = false, features = ["rustls", "abigen"] }
@@ -75,3 +79,13 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 
 [build-dependencies]
 tonic-build = "0.11"
+
+# ── Dependency un-rot ──────────────────────────────────────────────────────────
+# gennaro-dkg 0.8.0 transitively needs `uint-zigzag 0.2.1`, which pins `core2 ^0.4` —
+# and the only version in that range (core2 0.4.0) is YANKED (and absent on the
+# rsproxy.cn mirror). We replace uint-zigzag with a std-only in-tree fork that drops
+# core2 (uses std::io); version kept at 0.2.1 so it satisfies the `^0.2.1` requirement.
+# Only 3 non-algorithmic edits vs upstream; verified byte-identical behaviour + core2
+# fully removed from the lockfile. See vendor/uint-zigzag/.
+[patch.crates-io]
+uint-zigzag = { path = "vendor/uint-zigzag" }
