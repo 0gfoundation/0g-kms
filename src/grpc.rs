@@ -102,8 +102,18 @@ impl KmsCluster for KmsClusterService {
             return Ok(Response::new(shard));
         }
 
-        let shard = self.recover_shard_for_caller(&ctx.caller_pubkey).await?;
-        Ok(Response::new(shard))
+        // Can't serve an init shard. Signal whether WE are an initialized cluster member, so
+        // the caller's disaster gate can distinguish "the cluster exists" (must NOT let the
+        // caller regenerate a master) from "empty/uninitialized cluster" (genesis is fine).
+        //   - FailedPrecondition → we hold a shard: the cluster is live but shard recovery
+        //     isn't available yet (Phase 4). The caller must refuse to genesis.
+        //   - Unavailable → we're not initialized either: not evidence of an existing cluster.
+        if self.state.shard.read().await.is_some() {
+            return Err(Status::failed_precondition(
+                "cluster is active but shard recovery is not yet available (deferred to reshare)",
+            ));
+        }
+        Err(Status::unavailable("node not initialized"))
     }
 
     /// Gossip: update peer table with caller's info, return full member list.

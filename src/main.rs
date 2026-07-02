@@ -39,22 +39,35 @@ async fn main() -> Result<()> {
     let state = server::AppState::new(config.clone(), signing_key);
 
     // Bootstrap node: try to join first (handles restarts gracefully).
-    // If join fails and bootstrap=true, generate the masterKey as the first node.
+    // DISASTER GATE: only create a fresh master when NO peer is reachable (a genuine
+    // first-ever cluster start). If a peer is reachable but couldn't serve our shard, the
+    // cluster already exists — regenerating a master would fork it and lose every derived
+    // key, so we refuse and stay down until we can recover the shard (Phase 4 reshare).
     // Non-bootstrap nodes always join and fail hard if they can't.
+    use init::JoinResult;
     if config.cluster.bootstrap {
-        match init::join_cluster(&state).await {
-            Ok(_) => info!("Rejoined existing cluster"),
-            Err(e) => {
-                info!(error = %e, "Join failed — bootstrapping as first node");
+        match init::join_cluster(&state).await? {
+            JoinResult::Joined => info!("Rejoined existing cluster"),
+            JoinResult::NoSeedReachable => {
+                info!("No existing cluster reachable — bootstrapping as first node");
                 init::init_start_node(&state)
                     .await
                     .context("Bootstrap initialization failed")?;
             }
+            JoinResult::SeedReachableDeclined => {
+                anyhow::bail!(
+                    "a cluster peer is reachable but could not serve our shard; refusing to \
+                     regenerate a master (that would fork the cluster and lose all derived \
+                     keys). This node stays down until it can recover its shard via reshare \
+                     (Phase 4) or a peer serves it."
+                );
+            }
         }
     } else {
-        init::join_cluster(&state)
-            .await
-            .context("Failed to join cluster")?;
+        match init::join_cluster(&state).await? {
+            JoinResult::Joined => {}
+            _ => anyhow::bail!("failed to join cluster: no seed served our shard"),
+        }
     }
 
     // Start gossip background task (peer discovery + liveness)
