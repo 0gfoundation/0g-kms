@@ -23,6 +23,9 @@ use crate::{
 pub struct PeerInfo {
     pub grpc_url: String,
     pub last_seen: i64,
+    /// Uncompressed secp256k1 pubkey (65 bytes), learned via gossip. Empty until known;
+    /// needed to ECIES-encrypt DKG round-1 p2p shares to this peer.
+    pub pubkey: Vec<u8>,
 }
 
 // ─── Shared state ─────────────────────────────────────────────────────────────

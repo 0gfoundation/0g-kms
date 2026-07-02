@@ -126,6 +126,18 @@ pub fn gennaro_share_to_blsful(id: usize, scalar: DkgScalar) -> SecretKeyShare<B
     SecretKeyShare(DefaultShare { identifier, value })
 }
 
+/// This node's own uncompressed secp256k1 public key (65 bytes, 0x04-prefixed) from its
+/// private key. Gossiped to peers so they can ECIES-encrypt DKG round-1 p2p shares to us
+/// (peer_table otherwise only knows the eth_addr, a hash from which the pubkey can't be
+/// recovered).
+pub fn pubkey_from_private(private_key: &[u8; 32]) -> Result<Vec<u8>> {
+    use k256::ecdsa::SigningKey;
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    let sk = SigningKey::from_bytes(private_key.into())
+        .map_err(|e| anyhow!("invalid private key: {}", e))?;
+    Ok(sk.verifying_key().to_encoded_point(false).as_bytes().to_vec())
+}
+
 /// Serialize a partial signature (DPRF contribution) for the wire.
 pub fn partial_to_bytes(partial: &SignatureShare<Bls>) -> Vec<u8> {
     Vec::<u8>::from(partial)
