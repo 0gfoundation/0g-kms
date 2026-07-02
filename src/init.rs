@@ -1,10 +1,20 @@
+use std::num::NonZeroUsize;
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
+use gennaro_dkg::{Parameters, SecretParticipant};
+use group::GroupEncoding;
 use tracing::info;
 
 use crate::{
-    crypto::{ecies_decrypt, share_to_bytes, sign_request, split_master},
+    chain::get_signer_addresses,
+    crypto::{ecies_decrypt, gennaro_share_to_blsful, share_to_bytes, sign_request, split_master, DkgGroup},
+    dkg::{run_session, SessionPeer},
     server::{AppState, ShardState},
 };
+
+/// Per-round wall-clock budget for a DKG/reshare session.
+const DKG_ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bootstrap flow (first node ever):
 ///   1. Generate a fresh BLS12-381 master and Shamir-split it into total_nodes shares.
@@ -172,4 +182,135 @@ async fn request_shard_from_peer(
         shard_index: resp.shard_index,
         shard_bytes,
     })
+}
+
+// ─── Distributed cluster formation (genesis DKG / recovery) ─────────────────────
+
+/// Assemble the DKG participant set from the on-chain nodeList + gossip peer_table.
+/// Returns `None` until every other nodeList member is known *with its pubkey* (full
+/// membership) so genesis waits for gossip convergence. Otherwise returns
+/// `(own_id, other_peers, threshold, total)` where ids are 1-based nodeList positions.
+#[allow(clippy::type_complexity)]
+async fn assemble_participants(
+    state: &AppState,
+) -> Result<Option<(u32, Vec<SessionPeer>, usize, usize)>> {
+    let node_list = get_signer_addresses(
+        &state.config.chain.rpc_url,
+        &state.config.chain.contract_address,
+        &state.config.tapp.app_id,
+    )
+    .await
+    .map_err(|e| anyhow!("nodeList lookup failed: {}", e))?;
+
+    let own_addr = state.signing_key.eth_address;
+    let own_pos = node_list
+        .iter()
+        .position(|a| a.0 == own_addr)
+        .ok_or_else(|| anyhow!("this node's address is not in the on-chain nodeList"))?;
+    let own_id = own_pos as u32 + 1;
+
+    let table = state.peer_table.read().await;
+    let mut peers = Vec::new();
+    for (i, addr) in node_list.iter().enumerate() {
+        let id = i as u32 + 1;
+        if id == own_id {
+            continue;
+        }
+        match table.get(&addr.0) {
+            Some(info) if !info.pubkey.is_empty() => peers.push(SessionPeer {
+                id,
+                grpc_url: info.grpc_url.clone(),
+                pubkey: info.pubkey.clone(),
+            }),
+            // A nodeList member we haven't fully discovered yet (no URL/pubkey) → not ready.
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(Some((
+        own_id,
+        peers,
+        state.config.cluster.threshold as usize,
+        node_list.len(),
+    )))
+}
+
+/// Run distributed genesis DKG: all N nodes jointly generate the master (no dealer). On
+/// success this node holds a share of the shared key and the cluster's group public key.
+async fn run_genesis(
+    state: &AppState,
+    own_id: u32,
+    peers: Vec<SessionPeer>,
+    threshold: usize,
+    total: usize,
+) -> Result<()> {
+    let params = Parameters::<DkgGroup>::new(
+        NonZeroUsize::new(threshold).ok_or_else(|| anyhow!("threshold must be > 0"))?,
+        NonZeroUsize::new(total).ok_or_else(|| anyhow!("total_nodes must be > 0"))?,
+    );
+    let participant = SecretParticipant::<DkgGroup>::new(
+        NonZeroUsize::new(own_id as usize).unwrap(),
+        params,
+    )
+    .map_err(|e| anyhow!("genesis participant init: {:?}", e))?;
+
+    let session_id = format!("genesis:{}", state.config.tapp.app_id);
+    let (share, pk) = run_session(state, &session_id, participant, &peers, DKG_ROUND_TIMEOUT).await?;
+
+    let sk_share = gennaro_share_to_blsful(own_id as usize, share);
+    *state.shard.write().await = Some(ShardState {
+        shard_index: own_id,
+        shard_bytes: share_to_bytes(&sk_share),
+    });
+    *state.group_pubkey.write().await = Some(pk.to_bytes().as_ref().to_vec());
+    info!(own_id, "genesis DKG complete — share and group public key stored");
+    Ok(())
+}
+
+/// Background cluster formation, run once after the servers + gossip start.
+///
+/// 1. Wait for full membership (all nodeList members discovered via gossip, with pubkeys).
+/// 2. Decide fresh vs established by probing peers (reuses `join_cluster`'s classification):
+///    - no peer initialized → **fresh** → run genesis DKG together with all nodes.
+///    - a peer is already initialized → **established** → recover our share via reshare.
+///      DISASTER GATE: an established cluster must NEVER trigger genesis (would fork it).
+pub async fn form_cluster(state: AppState) {
+    if state.shard.read().await.is_some() {
+        return; // already have a shard (e.g. future persistent storage)
+    }
+
+    let (own_id, peers, threshold, total) = loop {
+        match assemble_participants(&state).await {
+            Ok(Some(p)) => break p,
+            Ok(None) => {
+                info!("waiting for full cluster membership (gossip convergence)…");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "membership assembly failed; retrying");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    };
+
+    match join_cluster(&state).await {
+        Ok(JoinResult::Joined) => {
+            info!("obtained a shard via assignment (legacy path)");
+        }
+        Ok(JoinResult::NoSeedReachable) => {
+            info!(own_id, total, threshold, "fresh cluster — running genesis DKG");
+            if let Err(e) = run_genesis(&state, own_id, peers, threshold, total).await {
+                tracing::error!(error = %e, "genesis DKG failed");
+            }
+        }
+        Ok(JoinResult::SeedReachableDeclined) => {
+            // Established cluster, we have no shard. Recover via reshare (Phase 4).
+            tracing::error!(
+                "cluster is already established but this node has no shard; reshare-based \
+                 recovery is not yet implemented (Phase 4). Refusing to regenerate a master."
+            );
+            // TODO(Phase 4): run reshare recovery to repair our share.
+        }
+        Err(e) => tracing::error!(error = %e, "cluster probe failed; not forming a key"),
+    }
 }
