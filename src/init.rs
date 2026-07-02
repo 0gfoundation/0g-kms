@@ -388,6 +388,51 @@ pub async fn run_reshare_dealer(
     Ok(())
 }
 
+/// Proactively refresh the whole live committee's shares — no membership change, no node
+/// lost a share. Every node reshares its existing share (all act as dealers), producing a
+/// fresh polynomial with the SAME intercept (master): shares are re-randomized so any
+/// previously-leaked share becomes useless (proactive security), while every derived app
+/// key is unchanged. Triggered manually (e.g. via `/refresh`); an operator can run it
+/// periodically. Reuses the dealer path — a refresh is just a reshare where the dealer set
+/// is the full committee and there is no recovering `RefreshParticipant`.
+pub async fn trigger_refresh(state: &AppState) -> Result<()> {
+    if state.shard.read().await.is_none() {
+        return Err(anyhow!("cannot refresh: this node has no share"));
+    }
+    let (own_id, peers, _t, _n) = assemble_participants(state)
+        .await?
+        .ok_or_else(|| anyhow!("refresh: full cluster membership not available"))?;
+
+    // Dealer set = the entire committee (every node contributes its share).
+    let mut dealer_ids: Vec<u32> = peers.iter().map(|p| p.id).collect();
+    dealer_ids.push(own_id);
+    dealer_ids.sort_unstable();
+
+    let epoch = chrono::Utc::now().timestamp();
+    let session_id = format!("refresh:{}:{}", state.config.tapp.app_id, epoch);
+
+    // Tell every peer to join the refresh as a dealer (recovering_id = 0: pure refresh).
+    let ts = chrono::Utc::now().timestamp();
+    let sig = sign_request(&state.signing_key.private_key, "StartReshare", ts)?;
+    for peer in &peers {
+        if let Err(e) = crate::grpc::send_start_reshare(
+            &peer.grpc_url,
+            &session_id,
+            0,
+            dealer_ids.clone(),
+            &sig,
+            ts,
+        )
+        .await
+        {
+            tracing::warn!(peer = %peer.grpc_url, error = %e, "failed to trigger refresh dealer");
+        }
+    }
+
+    info!(own_id, session = %session_id, "proactive refresh started");
+    run_reshare_dealer(state, session_id, dealer_ids).await
+}
+
 /// Background cluster formation, run once after the servers + gossip start.
 ///
 /// 1. Wait for full membership (all nodeList members discovered via gossip, with pubkeys).

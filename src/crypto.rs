@@ -514,4 +514,47 @@ mod dkg_tests {
         // = master). Survivors' shares change too, so an ORIGINAL share must NOT be mixed
         // with reshared ones — Phase 4 must persist every participant's new share.
     }
+
+    #[test]
+    fn dkg_proactive_refresh_preserves_master_and_expires_old_shares() {
+        // Genesis.
+        let params = Parameters::<G1Projective>::new(nz(2), nz(3));
+        let mut ps: Vec<_> = (1..=3)
+            .map(|i| SecretParticipant::<G1Projective>::new(nz(i), params).unwrap())
+            .collect();
+        drive(&mut ps);
+        let sh_old: Vec<(usize, Scalar)> = ps
+            .iter()
+            .map(|p| (p.get_id(), p.get_secret_share().unwrap()))
+            .collect();
+        let k0 = app_key(&sh_old, "app", b"m");
+
+        // Proactive refresh: every node reshares as a dealer (dealer set = the whole
+        // committee), producing a fresh polynomial with the same intercept.
+        let rp = Parameters::<G1Projective>::new(nz(2), nz(3));
+        let ids = [Scalar::from(1u64), Scalar::from(2u64), Scalar::from(3u64)];
+        let mut rs: Vec<_> = (0..3)
+            .map(|i| {
+                SecretParticipant::<G1Projective>::with_secret(nz(i + 1), rp, sh_old[i].1, &ids, i)
+                    .unwrap()
+            })
+            .collect();
+        drive(&mut rs);
+        let sh_new: Vec<(usize, Scalar)> = rs
+            .iter()
+            .map(|p| (p.get_id(), p.get_secret_share().unwrap()))
+            .collect();
+
+        // Master preserved: the refreshed committee derives the SAME key.
+        assert_eq!(app_key(&sh_new, "app", b"m"), k0, "refresh must preserve the master");
+        // Shares were actually re-randomized.
+        assert_ne!(sh_new[0].1, sh_old[0].1, "refresh must change the shares");
+        // Proactive security: a PRE-refresh share no longer combines with refreshed shares.
+        let mixed = [sh_old[0], sh_new[1]];
+        assert_ne!(
+            app_key(&mixed, "app", b"m"),
+            k0,
+            "a leaked pre-refresh share must be useless against refreshed shares"
+        );
+    }
 }
