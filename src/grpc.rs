@@ -133,11 +133,14 @@ impl KmsCluster for KmsClusterService {
                 let addr_bytes: [u8; 20] = ctx.caller_eth_addr.into();
                 let mut table = self.state.peer_table.write().await;
                 let is_new = !table.contains_key(&addr_bytes);
+                // Store the caller's pubkey recovered from their signature (authoritative),
+                // not a self-reported field.
                 table.insert(
                     addr_bytes,
                     PeerInfo {
                         grpc_url: info.grpc_url.clone(),
                         last_seen: now,
+                        pubkey: ctx.caller_pubkey.clone(),
                     },
                 );
                 if is_new {
@@ -156,6 +159,7 @@ impl KmsCluster for KmsClusterService {
             .map(|(addr, info)| NodeInfo {
                 grpc_url: info.grpc_url.clone(),
                 eth_addr: hex::encode(addr),
+                pubkey: info.pubkey.clone(),
             })
             .collect();
 
@@ -479,12 +483,17 @@ async fn gossip_round(state: &AppState) {
                                 .and_modify(|e| {
                                     e.grpc_url = peer.grpc_url.clone();
                                     e.last_seen = now;
+                                    // Don't clobber a known pubkey with an empty one.
+                                    if !peer.pubkey.is_empty() {
+                                        e.pubkey = peer.pubkey.clone();
+                                    }
                                 })
                                 .or_insert_with(|| {
                                     tracing::info!(peer_url = %peer.grpc_url, "gossip: discovered new peer");
                                     PeerInfo {
                                         grpc_url: peer.grpc_url.clone(),
                                         last_seen: now,
+                                        pubkey: peer.pubkey.clone(),
                                     }
                                 });
                         }
@@ -518,9 +527,12 @@ async fn push_gossip(
     let mut client = proto::kms_cluster_client::KmsClusterClient::new(channel);
 
     let mut request = Request::new(GossipRequest {
+        // pubkey left empty: the responder authoritatively records our pubkey by recovering
+        // it from the request signature (see the gossip handler), not from this field.
         self_info: Some(NodeInfo {
             grpc_url: self_url.to_string(),
             eth_addr: self_eth_addr.to_string(),
+            pubkey: Vec::new(),
         }),
     });
     request.metadata_mut().insert(
