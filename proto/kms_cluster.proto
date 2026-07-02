@@ -37,6 +37,13 @@ service KmsCluster {
   // Caller sends its own NodeInfo; responder updates its peer table and
   // returns its full known member list.  Acts as both discovery and heartbeat.
   rpc Gossip(GossipRequest) returns (GossipResponse);
+
+  // Threshold-BLS DKG / resharing transport (push model). Each participant sends its
+  // round-N output to every other participant; the recipient buffers by
+  // (session_id, round, from_index) and advances to round N+1 once it has all expected
+  // participants' round-N messages. Genesis (no dealer) and lost-share recovery (reshare)
+  // run the same gennaro rounds — session_id namespaces the instance.
+  rpc DkgRound(DkgRoundMsg) returns (DkgRoundAck);
 }
 
 // ─── DPRF messages ────────────────────────────────────────────────────────────
@@ -72,3 +79,15 @@ message GossipRequest {
 message GossipResponse {
   repeated NodeInfo peers = 1;
 }
+
+// ─── DKG / resharing messages ───────────────────────────────────────────────────
+
+message DkgRoundMsg {
+  string session_id = 1;  // "genesis:{app_id}" | "reshare:{app_id}:{epoch}"
+  uint32 round      = 2;  // 1..5
+  uint32 from_index = 3;  // sender's 1-based nodeList participant id
+  bytes  broadcast  = 4;  // serde_bare(RoundNBroadcastData) — broadcast to all participants
+  bytes  p2p        = 5;  // ECIES(serde_bare(Round1P2PData)) for THIS recipient (round 1 only)
+}
+
+message DkgRoundAck {}
