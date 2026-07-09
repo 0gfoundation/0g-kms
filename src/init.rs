@@ -205,6 +205,15 @@ async fn assemble_participants(
     .await
     .map_err(|e| anyhow!("nodeList lookup failed: {}", e))?;
 
+    // Genesis is a fixed `total_nodes`-of-`threshold` DKG. Wait until the on-chain nodeList
+    // has grown to the full configured size — nodes register one at a time, and starting a
+    // DKG against a partial list would use the wrong `total` (e.g. 1 when only this node has
+    // registered → limit < threshold → fails, and mismatched totals across nodes never align).
+    let total = state.config.cluster.total_nodes as usize;
+    if node_list.len() < total {
+        return Ok(None);
+    }
+
     let own_addr = state.signing_key.eth_address;
     let own_pos = node_list
         .iter()
@@ -234,7 +243,7 @@ async fn assemble_participants(
         own_id,
         peers,
         state.config.cluster.threshold as usize,
-        node_list.len(),
+        total,
     )))
 }
 
@@ -441,42 +450,51 @@ pub async fn trigger_refresh(state: &AppState) -> Result<()> {
 ///    - a peer is already initialized → **established** → recover our share via reshare.
 ///      DISASTER GATE: an established cluster must NEVER trigger genesis (would fork it).
 pub async fn form_cluster(state: AppState) {
-    if state.shard.read().await.is_some() {
-        return; // already have a shard (e.g. future persistent storage)
-    }
+    loop {
+        // Done once we hold a share (genesis/recovery succeeded, or a future persistent load).
+        if state.shard.read().await.is_some() {
+            return;
+        }
 
-    let (own_id, peers, threshold, total) = loop {
-        match assemble_participants(&state).await {
-            Ok(Some(p)) => break p,
+        // Wait until the full committee is registered on-chain AND discovered via gossip.
+        let (own_id, peers, threshold, total) = match assemble_participants(&state).await {
+            Ok(Some(p)) => p,
             Ok(None) => {
-                info!("waiting for full cluster membership (gossip convergence)…");
+                info!("waiting for full cluster membership (all nodes registered + discovered)…");
                 tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "membership assembly failed; retrying");
                 tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
             }
-        }
-    };
+        };
 
-    match join_cluster(&state).await {
-        Ok(JoinResult::Joined) => {
-            info!("obtained a shard via assignment (legacy path)");
-        }
-        Ok(JoinResult::NoSeedReachable) => {
-            info!(own_id, total, threshold, "fresh cluster — running genesis DKG");
-            if let Err(e) = run_genesis(&state, own_id, peers, threshold, total).await {
-                tracing::error!(error = %e, "genesis DKG failed");
+        let attempt = match join_cluster(&state).await {
+            Ok(JoinResult::Joined) => {
+                info!("obtained a shard via assignment (legacy path)");
+                Ok(())
             }
-        }
-        Ok(JoinResult::SeedReachableDeclined) => {
-            // Established cluster, we have no shard → recover our share via reshare from the
-            // live committee (never regenerate a master).
-            info!(own_id, "cluster established — recovering our share via reshare");
-            if let Err(e) = run_reshare_recovery(&state, own_id, peers, threshold, total).await {
-                tracing::error!(error = %e, "reshare recovery failed — this node stays without a shard");
+            Ok(JoinResult::NoSeedReachable) => {
+                info!(own_id, total, threshold, "fresh cluster — running genesis DKG");
+                run_genesis(&state, own_id, peers, threshold, total).await
             }
+            Ok(JoinResult::SeedReachableDeclined) => {
+                // Established cluster, no local share → recover via reshare (never regenerate).
+                info!(own_id, "cluster established — recovering our share via reshare");
+                run_reshare_recovery(&state, own_id, peers, threshold, total).await
+            }
+            Err(e) => Err(anyhow!("cluster probe failed: {}", e)),
+        };
+
+        // Retry on failure: nodes register/boot at slightly different times, so a genesis or
+        // reshare round can time out before every participant is in the session. Keep retrying
+        // until the whole committee lines up and one attempt succeeds (then the top-of-loop
+        // shard check returns).
+        if let Err(e) = attempt {
+            tracing::warn!(error = %e, "cluster formation attempt failed; retrying in 10s");
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
-        Err(e) => tracing::error!(error = %e, "cluster probe failed; not forming a key"),
     }
 }
