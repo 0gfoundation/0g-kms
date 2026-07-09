@@ -1,12 +1,25 @@
+# 0g-kms node deployment — ONE parameterised compose for every node (one node per host).
+# Per host, set the vars below (e.g. in a .env file next to this compose; see .env.example):
+#   KMS_CONFIG     this host's node config    (kms.toml / kms-node2.toml / kms-node3.toml)
+#   KMS_HTTP_PORT  host port for /app-key,/refresh   (container binds 9090)
+#   KMS_GRPC_PORT  host port for inter-node gRPC      (container binds 9092)
+#   KMS_IMAGE      image to run (defaults to the published tag)
+#
+# Node 1:  KMS_CONFIG=./kms.toml       KMS_HTTP_PORT=9090   docker compose up -d
+# Node 2:  KMS_CONFIG=./kms-node2.toml KMS_HTTP_PORT=9091   docker compose up -d   (on host 2)
+# Node 3:  KMS_CONFIG=./kms-node3.toml KMS_HTTP_PORT=9091   docker compose up -d   (on host 3)
+#
+# For a self-contained multi-node LOCAL TEST (builds from source, mock chain + mock TEE),
+# use test/local-cluster/docker-compose.test.yml instead — that harness is separate by design.
 services:
   kms:
-    image: eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-kms:latest
+    image: ${KMS_IMAGE:-eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-kms:latest}
     command: ["kms-server", "/config/kms.toml"]
     ports:
-      - "9090:9090"
-      - "9092:9092"
+      - "${KMS_HTTP_PORT:-9090}:9090"   # HTTP: /app-key, /refresh
+      - "${KMS_GRPC_PORT:-9092}:9092"   # inter-node gRPC
     volumes:
-      - ./kms.toml:/config/kms.toml:ro
+      - "${KMS_CONFIG:-./kms.toml}:/config/kms.toml:ro"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
