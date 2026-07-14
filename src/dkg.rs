@@ -25,12 +25,16 @@ use crate::grpc::send_dkg_round;
 use crate::server::AppState;
 
 /// One other participant in a session (self is excluded).
+#[derive(Clone)]
 pub struct SessionPeer {
     /// 1-based participant id (nodeList position).
     pub id: u32,
     pub grpc_url: String,
     /// Uncompressed secp256k1 pubkey (65 bytes) for round-1 p2p ECIES.
     pub pubkey: Vec<u8>,
+    /// Peer's current polynomial epoch (gossiped; 0 = no share). A peer with epoch > 0 holds
+    /// a share and can act as a reshare dealer.
+    pub epoch: u64,
 }
 
 fn ser<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {

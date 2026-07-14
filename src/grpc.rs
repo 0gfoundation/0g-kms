@@ -220,8 +220,14 @@ impl KmsCluster for KmsClusterService {
         let state = self.state.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                crate::init::run_reshare_dealer(&state, req.session_id, req.dealer_ids, req.epoch)
-                    .await
+                crate::init::run_reshare_dealer(
+                    &state,
+                    req.session_id,
+                    req.recovering_id,
+                    req.dealer_ids,
+                    req.epoch,
+                )
+                .await
             {
                 tracing::error!(error = %e, "reshare dealer session failed");
             }
