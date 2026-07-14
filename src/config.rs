@@ -32,6 +32,13 @@ pub struct TappConfig {
     /// tapp-server gRPC port.
     #[serde(default = "default_tapp_port")]
     pub tapp_port: u16,
+    /// Optional Unix-domain-socket path to the local tapp-server (e.g.
+    /// "/run/tapp/tapp.sock"). When set, the KMS connects over this socket (local
+    /// IPC) instead of TCP (`tapp_ip:tapp_port`) — the KMS runs on the same host as
+    /// its tapp-server, so "local = socket, external = gRPC/TCP". TCP stays the
+    /// default when unset, so existing configs are unaffected.
+    #[serde(default)]
+    pub tapp_socket: Option<String>,
     /// If true, use MOCK_APP_PRIVATE_KEY env var instead of calling tapp-server.
     /// For development and CI only — never set in production.
     #[serde(default)]
