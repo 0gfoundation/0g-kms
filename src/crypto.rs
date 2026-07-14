@@ -516,6 +516,94 @@ mod dkg_tests {
     }
 
     #[test]
+    fn dkg_reshare_recovers_with_absent_committee_member() {
+        // The issue #4 case: recover a lost share while ANOTHER committee member is DOWN.
+        // 2-of-4 genesis, then node1 recovers with only dealers {3,4} (= threshold) while
+        // node2 is absent. `limit` stays 4 (nominal committee), so node2 is not removed — it
+        // just falls behind and recovers later. This is what lets a node rejoin with only
+        // `threshold` live share-holders instead of full membership.
+        let params = Parameters::<G1Projective>::new(nz(2), nz(4));
+        let mut ps: Vec<_> = (1..=4)
+            .map(|i| SecretParticipant::<G1Projective>::new(nz(i), params).unwrap())
+            .collect();
+        drive(&mut ps);
+        let pk0 = ps[0].get_public_key().unwrap();
+        let sh0: Vec<(usize, Scalar)> = ps
+            .iter()
+            .map(|p| (p.get_id(), p.get_secret_share().unwrap()))
+            .collect();
+        let k0 = app_key(&sh0[0..2], "app", b"m");
+
+        // Reshare among {1(recovering), 3(dealer), 4(dealer)}; node2 never participates.
+        let rp = Parameters::<G1Projective>::new(nz(2), nz(4));
+        let dealer_ids = [Scalar::from(3u64), Scalar::from(4u64)];
+        let mut r1 = RefreshParticipant::<G1Projective>::new(nz(1), rp).unwrap();
+        let mut d3 =
+            SecretParticipant::<G1Projective>::with_secret(nz(3), rp, sh0[2].1, &dealer_ids, 0)
+                .unwrap();
+        let mut d4 =
+            SecretParticipant::<G1Projective>::with_secret(nz(4), rp, sh0[3].1, &dealer_ids, 1)
+                .unwrap();
+
+        let (b1, p1) = r1.round1().unwrap();
+        let (b3, p3) = d3.round1().unwrap();
+        let (b4, p4) = d4.round1().unwrap();
+
+        // Only present participants {1,3,4} exchange round-2 data (node2 is down).
+        let r2_1 = r1
+            .round2(
+                BTreeMap::from([(3, b3.clone()), (4, b4.clone())]),
+                BTreeMap::from([(3, p3[&1].clone()), (4, p4[&1].clone())]),
+            )
+            .unwrap();
+        let r2_3 = d3
+            .round2(
+                BTreeMap::from([(1, b1.clone()), (4, b4.clone())]),
+                BTreeMap::from([(1, p1[&3].clone()), (4, p4[&3].clone())]),
+            )
+            .unwrap();
+        let r2_4 = d4
+            .round2(
+                BTreeMap::from([(1, b1.clone()), (3, b3.clone())]),
+                BTreeMap::from([(1, p1[&4].clone()), (3, p3[&4].clone())]),
+            )
+            .unwrap();
+
+        let b2map = BTreeMap::from([(1, r2_1), (3, r2_3), (4, r2_4)]);
+        let b3map = BTreeMap::from([
+            (1, r1.round3(&b2map).unwrap()),
+            (3, d3.round3(&b2map).unwrap()),
+            (4, d4.round3(&b2map).unwrap()),
+        ]);
+        let b4map = BTreeMap::from([
+            (1, r1.round4(&b3map).unwrap()),
+            (3, d3.round4(&b3map).unwrap()),
+            (4, d4.round4(&b3map).unwrap()),
+        ]);
+        r1.round5(&b4map).unwrap();
+        d3.round5(&b4map).unwrap();
+        d4.round5(&b4map).unwrap();
+
+        // Master preserved, and node1 recovered a consistent share though node2 was absent.
+        assert_eq!(
+            r1.get_public_key().unwrap(),
+            pk0,
+            "recovery with an absent committee member must preserve the master"
+        );
+        let sh_new = [
+            (1, r1.get_secret_share().unwrap()),
+            (3, d3.get_secret_share().unwrap()),
+            (4, d4.get_secret_share().unwrap()),
+        ];
+        assert_eq!(
+            app_key(&sh_new[0..2], "app", b"m"),
+            k0,
+            "recovered {{1,3}} derives the original key"
+        );
+        assert_eq!(app_key(&sh_new, "app", b"m"), k0, "recovered {{1,3,4}} agrees");
+    }
+
+    #[test]
     fn dkg_proactive_refresh_preserves_master_and_expires_old_shares() {
         // Genesis.
         let params = Parameters::<G1Projective>::new(nz(2), nz(3));
