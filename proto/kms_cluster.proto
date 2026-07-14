@@ -62,6 +62,8 @@ message DprfPartialRequest {
 message EncryptedPartial {
   bytes  ciphertext  = 1;  // ECIES(partial signature bytes) for the caller
   uint32 shard_index = 2;  // source node's shard index (for dedup at the coordinator)
+  uint64 epoch       = 3;  // polynomial epoch of the share that produced this partial;
+                           // the coordinator only combines partials of a single epoch
 }
 
 // ─── Shard messages ───────────────────────────────────────────────────────────
@@ -77,6 +79,8 @@ message NodeInfo {
   string grpc_url = 1;  // e.g. "http://1.2.3.4:9092"
   string eth_addr = 2;  // lowercase hex, no 0x prefix (20 bytes = 40 chars)
   bytes  pubkey   = 3;  // uncompressed secp256k1 pubkey (65 bytes) for DKG p2p ECIES; may be empty
+  uint64 epoch    = 4;  // sender's current polynomial epoch (0 = no share yet); lets every
+                        // node agree on the cluster epoch and reshares pick a monotonic next one
 }
 
 message GossipRequest {
@@ -100,9 +104,11 @@ message DkgRoundMsg {
 message DkgRoundAck {}
 
 message ReshareRequest {
-  string session_id     = 1;  // "reshare:{app_id}:{epoch}"
+  string session_id     = 1;  // "reshare:{app_id}:{epoch}:{nonce}"
   uint32 recovering_id  = 2;  // participant id of the node being recovered
   repeated uint32 dealer_ids = 3;  // ids of the dealers (survivors contributing shares), in order
+  uint64 epoch          = 4;  // new polynomial epoch every participant stamps its refreshed
+                              // share with (chosen by the trigger as known_epoch + 1)
 }
 
 message ReshareAck {}

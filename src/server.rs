@@ -26,6 +26,9 @@ pub struct PeerInfo {
     /// Uncompressed secp256k1 pubkey (65 bytes), learned via gossip. Empty until known;
     /// needed to ECIES-encrypt DKG round-1 p2p shares to this peer.
     pub pubkey: Vec<u8>,
+    /// Peer's current polynomial epoch, learned via gossip (0 = no share yet). Used to agree
+    /// on the cluster epoch so a reshare picks a monotonically increasing next epoch.
+    pub epoch: u64,
 }
 
 // ─── Shared state ─────────────────────────────────────────────────────────────
@@ -34,6 +37,10 @@ pub struct PeerInfo {
 pub struct ShardState {
     pub shard_index: u32,
     pub shard_bytes: Vec<u8>,
+    /// Polynomial epoch this share belongs to. Genesis = 1; every reshare/refresh/recovery
+    /// bumps it. Partials are tagged with this so the coordinator never Lagrange-combines
+    /// shares from two different polynomials (which would yield a wrong key).
+    pub epoch: u64,
 }
 
 /// Inbound round messages for one DKG/reshare session, buffered until the driver consumes
@@ -89,6 +96,22 @@ impl AppState {
 
     pub async fn is_initialized(&self) -> bool {
         self.shard.read().await.is_some()
+    }
+
+    /// Highest polynomial epoch this node currently knows about: its own share's epoch and
+    /// every peer epoch learned via gossip. The cluster's live epoch is the max any member
+    /// holds; a fresh cluster (no shares anywhere) is 0.
+    pub async fn known_epoch(&self) -> u64 {
+        let own = self.shard.read().await.as_ref().map(|s| s.epoch).unwrap_or(0);
+        let peer_max = self
+            .peer_table
+            .read()
+            .await
+            .values()
+            .map(|p| p.epoch)
+            .max()
+            .unwrap_or(0);
+        own.max(peer_max)
     }
 
     /// Snapshot of current peer gRPC URLs from the dynamic peer table.

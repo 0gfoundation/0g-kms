@@ -65,6 +65,7 @@ impl KmsCluster for KmsClusterService {
         Ok(Response::new(EncryptedPartial {
             ciphertext,
             shard_index: shard.shard_index,
+            epoch: shard.epoch,
         }))
     }
 
@@ -141,6 +142,7 @@ impl KmsCluster for KmsClusterService {
                         grpc_url: info.grpc_url.clone(),
                         last_seen: now,
                         pubkey: ctx.caller_pubkey.clone(),
+                        epoch: info.epoch,
                     },
                 );
                 if is_new {
@@ -160,6 +162,7 @@ impl KmsCluster for KmsClusterService {
                 grpc_url: info.grpc_url.clone(),
                 eth_addr: hex::encode(addr),
                 pubkey: info.pubkey.clone(),
+                epoch: info.epoch,
             })
             .collect();
 
@@ -217,7 +220,8 @@ impl KmsCluster for KmsClusterService {
         let state = self.state.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                crate::init::run_reshare_dealer(&state, req.session_id, req.dealer_ids).await
+                crate::init::run_reshare_dealer(&state, req.session_id, req.dealer_ids, req.epoch)
+                    .await
             {
                 tracing::error!(error = %e, "reshare dealer session failed");
             }
@@ -297,7 +301,7 @@ pub async fn get_dprf_partial(
     sig: &[u8],
     timestamp: i64,
     own_private_key: &[u8; 32],
-) -> anyhow::Result<(u32, Vec<u8>)> {
+) -> anyhow::Result<(u32, Vec<u8>, u64)> {
     use tonic::metadata::MetadataValue;
     use tonic::transport::Channel;
 
@@ -330,7 +334,7 @@ pub async fn get_dprf_partial(
     let partial_bytes = ecies_decrypt(own_private_key, &resp.ciphertext)
         .map_err(|e| anyhow::anyhow!("ECIES decrypt failed: {}", e))?;
 
-    Ok((resp.shard_index, partial_bytes))
+    Ok((resp.shard_index, partial_bytes, resp.epoch))
 }
 
 /// Deliver one DKG/reshare round message to a peer (fire-and-forget beyond the ack).
@@ -376,19 +380,25 @@ pub async fn send_start_reshare(
     session_id: &str,
     recovering_id: u32,
     dealer_ids: Vec<u32>,
+    epoch: u64,
     sig: &[u8],
     timestamp: i64,
 ) -> anyhow::Result<()> {
     use tonic::metadata::MetadataValue;
     use tonic::transport::Channel;
 
-    let channel = Channel::from_shared(peer_url.to_string())?.connect().await?;
+    let channel = Channel::from_shared(peer_url.to_string())?
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(3))
+        .connect()
+        .await?;
     let mut client = proto::kms_cluster_client::KmsClusterClient::new(channel);
 
     let mut request = Request::new(ReshareRequest {
         session_id: session_id.to_string(),
         recovering_id,
         dealer_ids,
+        epoch,
     });
     request
         .metadata_mut()
@@ -432,13 +442,28 @@ pub async fn collect_and_dprf(
 
     let threshold = state.config.cluster.threshold as usize;
 
-    // Own partial is always valid; collect peer partials until we have `threshold` of them,
-    // then STOP. A dead node must not affect normal use: we never wait for stragglers once
-    // enough valid partials are in — pending peer futures (incl. an unreachable one still
-    // connecting) are simply dropped/cancelled when this returns.
-    let mut partials = vec![own_partial];
-    let mut seen = std::collections::HashSet::new();
-    seen.insert(own.shard_index);
+    // Collect partials until ONE epoch reaches `threshold`, then STOP and combine that epoch.
+    //
+    // Two invariants combine here:
+    //   * Never mix epochs: partials from two different polynomials Lagrange-combine to a wrong
+    //     key, so we bucket by epoch and only ever combine a single-epoch set. (Every epoch
+    //     shares the same master, so any single-epoch threshold set yields the same app key —
+    //     it doesn't matter which epoch fills first.)
+    //   * A dead node must not affect normal use: we return as soon as some epoch has enough,
+    //     never waiting for stragglers; pending peer futures (incl. an unreachable one still
+    //     connecting) are dropped/cancelled on return.
+    let mut buckets: std::collections::HashMap<u64, Vec<_>> = std::collections::HashMap::new();
+    // Per-epoch dedup by source shard index (stale peer_table entries can yield a node twice,
+    // which would feed a duplicate Lagrange identifier into the combine).
+    let mut seen: std::collections::HashMap<u64, std::collections::HashSet<u32>> =
+        std::collections::HashMap::new();
+    let mut ready: Option<u64> = None;
+
+    seen.entry(own.epoch).or_default().insert(own.shard_index);
+    buckets.entry(own.epoch).or_default().push(own_partial);
+    if buckets[&own.epoch].len() >= threshold {
+        ready = Some(own.epoch);
+    }
 
     let peer_urls = state.peer_urls().await;
     let mut peer_futures: FuturesUnordered<_> = peer_urls
@@ -448,37 +473,41 @@ pub async fn collect_and_dprf(
         })
         .collect();
 
-    while partials.len() < threshold {
+    while ready.is_none() {
         match peer_futures.next().await {
-            // Dedup by source shard index: stale peer_table entries can yield the same node
-            // twice, which would feed duplicate Lagrange identifiers into the combine.
-            Some(Ok((idx, bytes))) => {
-                if !seen.insert(idx) {
+            Some(Ok((idx, bytes, epoch))) => {
+                if !seen.entry(epoch).or_default().insert(idx) {
                     continue;
                 }
                 // Parse best-effort: a peer whose gRPC + ECIES succeed can still return an
-                // empty/malformed payload. Discard it individually (don't count it toward
-                // the threshold) rather than aborting — tolerate up to n - threshold bad nodes.
+                // empty/malformed payload. Discard it individually (don't count it) rather than
+                // aborting — tolerate up to n - threshold bad nodes.
                 match partial_from_bytes(&bytes) {
-                    Ok(p) => partials.push(p),
-                    Err(e) => tracing::warn!(shard_index = idx, error = %e, "discarding malformed partial"),
+                    Ok(p) => {
+                        let bucket = buckets.entry(epoch).or_default();
+                        bucket.push(p);
+                        if bucket.len() >= threshold {
+                            ready = Some(epoch);
+                        }
+                    }
+                    Err(e) => tracing::warn!(shard_index = idx, epoch, error = %e, "discarding malformed partial"),
                 }
             }
             Some(Err(e)) => tracing::warn!(error = %e, "peer partial collection failed"),
-            // No more peers to hear from and still short of threshold.
+            // No more peers to hear from and still short of threshold in every epoch.
             None => break,
         }
     }
 
-    if partials.len() < threshold {
-        return Err(KmsError::CryptoError(format!(
-            "not enough valid partials: got {}, need {}",
-            partials.len(),
-            threshold
-        )));
-    }
+    let epoch = ready.ok_or_else(|| {
+        let best = buckets.values().map(|b| b.len()).max().unwrap_or(0);
+        KmsError::CryptoError(format!(
+            "not enough valid partials in any single epoch: best {}, need {}",
+            best, threshold
+        ))
+    })?;
 
-    dprf_combine(&partials).map_err(|e| KmsError::CryptoError(e.to_string()))
+    dprf_combine(&buckets[&epoch]).map_err(|e| KmsError::CryptoError(e.to_string()))
 }
 
 // ─── Gossip background task ───────────────────────────────────────────────────
@@ -528,9 +557,10 @@ async fn gossip_round(state: &AppState) {
     };
 
     let self_eth_addr = hex::encode(state.signing_key.eth_address);
+    let self_epoch = state.shard.read().await.as_ref().map(|s| s.epoch).unwrap_or(0);
 
     for target in &targets {
-        match push_gossip(target, self_url, &self_eth_addr, &sig, timestamp).await {
+        match push_gossip(target, self_url, &self_eth_addr, self_epoch, &sig, timestamp).await {
             Ok(received) => {
                 let now = chrono::Utc::now().timestamp();
                 let mut table = state.peer_table.write().await;
@@ -552,6 +582,9 @@ async fn gossip_round(state: &AppState) {
                                     if !peer.pubkey.is_empty() {
                                         e.pubkey = peer.pubkey.clone();
                                     }
+                                    // Epoch is monotonic per node; take the larger so a stale
+                                    // gossip entry can't drag a peer's known epoch backwards.
+                                    e.epoch = e.epoch.max(peer.epoch);
                                 })
                                 .or_insert_with(|| {
                                     tracing::info!(peer_url = %peer.grpc_url, "gossip: discovered new peer");
@@ -559,6 +592,7 @@ async fn gossip_round(state: &AppState) {
                                         grpc_url: peer.grpc_url.clone(),
                                         last_seen: now,
                                         pubkey: peer.pubkey.clone(),
+                                        epoch: peer.epoch,
                                     }
                                 });
                         }
@@ -579,6 +613,7 @@ async fn push_gossip(
     peer_url: &str,
     self_url: &str,
     self_eth_addr: &str,
+    self_epoch: u64,
     sig: &[u8],
     timestamp: i64,
 ) -> anyhow::Result<Vec<NodeInfo>> {
@@ -586,6 +621,8 @@ async fn push_gossip(
     use tonic::transport::Channel;
 
     let channel = Channel::from_shared(peer_url.to_string())?
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(3))
         .connect()
         .await?;
 
@@ -598,6 +635,7 @@ async fn push_gossip(
             grpc_url: self_url.to_string(),
             eth_addr: self_eth_addr.to_string(),
             pubkey: Vec::new(),
+            epoch: self_epoch,
         }),
     });
     request.metadata_mut().insert(
