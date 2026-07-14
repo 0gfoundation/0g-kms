@@ -19,6 +19,10 @@ use crate::{
 /// Per-round wall-clock budget for a DKG/reshare session.
 const DKG_ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Epoch stamped on the shares produced by the initial distributed genesis. Every subsequent
+/// reshare/refresh/recovery advances the epoch by one.
+pub const GENESIS_EPOCH: u64 = 1;
+
 /// Bootstrap flow (first node ever):
 ///   1. Generate a fresh BLS12-381 master and Shamir-split it into total_nodes shares.
 ///   2. Store own shard (position 0 in nodeList) in state.shard.
@@ -52,6 +56,7 @@ pub async fn init_start_node(state: &AppState) -> Result<()> {
     *state.shard.write().await = Some(ShardState {
         shard_index: own_index,
         shard_bytes: own_bytes,
+        epoch: GENESIS_EPOCH,
     });
     *state.pending_shards.write().await = Some(shards);
 
@@ -184,6 +189,7 @@ async fn request_shard_from_peer(
     Ok(ShardState {
         shard_index: resp.shard_index,
         shard_bytes,
+        epoch: GENESIS_EPOCH,
     })
 }
 
@@ -273,10 +279,11 @@ async fn run_genesis(
     *state.shard.write().await = Some(ShardState {
         shard_index: own_id,
         shard_bytes: share_to_bytes(&sk_share),
+        epoch: GENESIS_EPOCH,
     });
     let pk_bytes = pk.to_bytes().as_ref().to_vec();
     *state.group_pubkey.write().await = Some(pk_bytes.clone());
-    info!(own_id, group_pubkey = %hex::encode(&pk_bytes), "genesis DKG complete — share and group public key stored");
+    info!(own_id, epoch = GENESIS_EPOCH, group_pubkey = %hex::encode(&pk_bytes), "genesis DKG complete — share and group public key stored");
     Ok(())
 }
 
@@ -290,8 +297,12 @@ async fn run_reshare_recovery(
     threshold: usize,
     total: usize,
 ) -> Result<()> {
-    let epoch = chrono::Utc::now().timestamp();
-    let session_id = format!("reshare:{}:{}", state.config.tapp.app_id, epoch);
+    // New polynomial epoch: strictly above whatever the live committee currently holds
+    // (learned via gossip). All participants stamp their refreshed share with this, so the
+    // recovered node lands on the same epoch as the dealers rather than a stale one.
+    let new_epoch = state.known_epoch().await + 1;
+    let nonce = chrono::Utc::now().timestamp();
+    let session_id = format!("reshare:{}:{}:{}", state.config.tapp.app_id, new_epoch, nonce);
     let mut dealer_ids: Vec<u32> = peers.iter().map(|p| p.id).collect();
     dealer_ids.sort_unstable();
 
@@ -304,6 +315,7 @@ async fn run_reshare_recovery(
             &session_id,
             own_id,
             dealer_ids.clone(),
+            new_epoch,
             &sig,
             ts,
         )
@@ -326,10 +338,11 @@ async fn run_reshare_recovery(
     *state.shard.write().await = Some(ShardState {
         shard_index: own_id,
         shard_bytes: share_to_bytes(&sk_share),
+        epoch: new_epoch,
     });
     let pk_bytes = pk.to_bytes().as_ref().to_vec();
     *state.group_pubkey.write().await = Some(pk_bytes.clone());
-    info!(own_id, group_pubkey = %hex::encode(&pk_bytes), "reshare recovery complete — share repaired, master preserved");
+    info!(own_id, epoch = new_epoch, group_pubkey = %hex::encode(&pk_bytes), "reshare recovery complete — share repaired, master preserved");
     Ok(())
 }
 
@@ -341,6 +354,7 @@ pub async fn run_reshare_dealer(
     state: &AppState,
     session_id: String,
     dealer_ids: Vec<u32>,
+    new_epoch: u64,
 ) -> Result<()> {
     let (own_id, peers, threshold, total) = assemble_participants(state)
         .await?
@@ -392,8 +406,9 @@ pub async fn run_reshare_dealer(
     *state.shard.write().await = Some(ShardState {
         shard_index: own_id,
         shard_bytes: share_to_bytes(&sk_share),
+        epoch: new_epoch,
     });
-    info!(own_id, group_pubkey = %hex::encode(&new_pk_bytes), "reshare dealer complete — share refreshed, master preserved");
+    info!(own_id, epoch = new_epoch, group_pubkey = %hex::encode(&new_pk_bytes), "reshare dealer complete — share refreshed, master preserved");
     Ok(())
 }
 
@@ -417,8 +432,9 @@ pub async fn trigger_refresh(state: &AppState) -> Result<()> {
     dealer_ids.push(own_id);
     dealer_ids.sort_unstable();
 
-    let epoch = chrono::Utc::now().timestamp();
-    let session_id = format!("refresh:{}:{}", state.config.tapp.app_id, epoch);
+    let new_epoch = state.known_epoch().await + 1;
+    let nonce = chrono::Utc::now().timestamp();
+    let session_id = format!("refresh:{}:{}:{}", state.config.tapp.app_id, new_epoch, nonce);
 
     // Tell every peer to join the refresh as a dealer (recovering_id = 0: pure refresh).
     let ts = chrono::Utc::now().timestamp();
@@ -429,6 +445,7 @@ pub async fn trigger_refresh(state: &AppState) -> Result<()> {
             &session_id,
             0,
             dealer_ids.clone(),
+            new_epoch,
             &sig,
             ts,
         )
@@ -438,8 +455,8 @@ pub async fn trigger_refresh(state: &AppState) -> Result<()> {
         }
     }
 
-    info!(own_id, session = %session_id, "proactive refresh started");
-    run_reshare_dealer(state, session_id, dealer_ids).await
+    info!(own_id, epoch = new_epoch, session = %session_id, "proactive refresh started");
+    run_reshare_dealer(state, session_id, dealer_ids, new_epoch).await
 }
 
 /// Background cluster formation, run once after the servers + gossip start.
