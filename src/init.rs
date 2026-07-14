@@ -198,11 +198,32 @@ async fn request_shard_from_peer(
 /// Assemble the DKG participant set from the on-chain nodeList + gossip peer_table.
 /// Returns `None` until every other nodeList member is known *with its pubkey* (full
 /// membership) so genesis waits for gossip convergence. Otherwise returns
-/// `(own_id, other_peers, threshold, total)` where ids are 1-based nodeList positions.
-#[allow(clippy::type_complexity)]
-async fn assemble_participants(
-    state: &AppState,
-) -> Result<Option<(u32, Vec<SessionPeer>, usize, usize)>> {
+/// Committee membership assembled from the on-chain nodeList + gossip peer_table.
+struct Membership {
+    /// This node's 1-based nodeList position / participant id.
+    own_id: u32,
+    /// Other nodeList members currently discovered via gossip (pubkey present), each carrying
+    /// its gossiped epoch. Undiscovered (down) members are simply absent from this list.
+    peers: Vec<SessionPeer>,
+    threshold: usize,
+    /// Nominal committee size = `cluster.total_nodes` (NOT the count discovered).
+    total: usize,
+    /// True iff every nodeList member besides self is present in `peers` (nobody is down).
+    all_discovered: bool,
+}
+
+impl Membership {
+    /// Discovered peers that currently hold a share (epoch > 0) — the candidate reshare dealers.
+    fn live_dealers(&self) -> Vec<SessionPeer> {
+        self.peers.iter().filter(|p| p.epoch > 0).cloned().collect()
+    }
+}
+
+/// Assemble the committee from chain + gossip. Returns `None` only while the on-chain nodeList
+/// hasn't grown to the configured size yet (registration is one-at-a-time). Otherwise returns
+/// whoever is currently discovered — callers decide sufficiency: genesis needs
+/// `all_discovered`, recovery needs only `>= threshold` live share-holders.
+async fn assemble_participants(state: &AppState) -> Result<Option<Membership>> {
     let node_list = get_signer_addresses(
         &state.config.chain.rpc_url,
         &state.config.chain.contract_address,
@@ -211,10 +232,9 @@ async fn assemble_participants(
     .await
     .map_err(|e| anyhow!("nodeList lookup failed: {}", e))?;
 
-    // Genesis is a fixed `total_nodes`-of-`threshold` DKG. Wait until the on-chain nodeList
-    // has grown to the full configured size — nodes register one at a time, and starting a
-    // DKG against a partial list would use the wrong `total` (e.g. 1 when only this node has
-    // registered → limit < threshold → fails, and mismatched totals across nodes never align).
+    // Genesis is a fixed `total_nodes`-of-`threshold` DKG; wait until the on-chain nodeList has
+    // grown to the full configured size (nodes register one at a time — a partial list would
+    // give the wrong `total`).
     let total = state.config.cluster.total_nodes as usize;
     if node_list.len() < total {
         return Ok(None);
@@ -229,6 +249,7 @@ async fn assemble_participants(
 
     let table = state.peer_table.read().await;
     let mut peers = Vec::new();
+    let mut all_discovered = true;
     for (i, addr) in node_list.iter().enumerate() {
         let id = i as u32 + 1;
         if id == own_id {
@@ -239,18 +260,60 @@ async fn assemble_participants(
                 id,
                 grpc_url: info.grpc_url.clone(),
                 pubkey: info.pubkey.clone(),
+                epoch: info.epoch,
             }),
-            // A nodeList member we haven't fully discovered yet (no URL/pubkey) → not ready.
-            _ => return Ok(None),
+            // A nodeList member not yet fully discovered (down / no pubkey). Don't bail —
+            // note the gap so genesis can wait while recovery can proceed on the live subset.
+            _ => all_discovered = false,
         }
     }
 
-    Ok(Some((
+    Ok(Some(Membership {
         own_id,
         peers,
-        state.config.cluster.threshold as usize,
+        threshold: state.config.cluster.threshold as usize,
         total,
-    )))
+        all_discovered,
+    }))
+}
+
+/// Resolve an explicit set of participant ids to `SessionPeer`s via nodeList + peer_table
+/// (excluding self and id 0). Used by the reshare dealer, whose session membership is the
+/// exact `{dealers} ∪ {recovering}` set from the request — not the full committee.
+async fn resolve_peers(state: &AppState, ids: &[u32], own_id: u32) -> Result<Vec<SessionPeer>> {
+    let node_list = get_signer_addresses(
+        &state.config.chain.rpc_url,
+        &state.config.chain.contract_address,
+        &state.config.tapp.app_id,
+    )
+    .await
+    .map_err(|e| anyhow!("nodeList lookup failed: {}", e))?;
+    let table = state.peer_table.read().await;
+    let mut peers = Vec::new();
+    for &id in ids {
+        if id == 0 || id == own_id {
+            continue;
+        }
+        let addr = node_list
+            .get((id - 1) as usize)
+            .ok_or_else(|| anyhow!("participant id {} out of nodeList range", id))?;
+        match table.get(&addr.0) {
+            Some(info) if !info.pubkey.is_empty() => peers.push(SessionPeer {
+                id,
+                grpc_url: info.grpc_url.clone(),
+                pubkey: info.pubkey.clone(),
+                epoch: info.epoch,
+            }),
+            _ => return Err(anyhow!("reshare participant {} not discovered via gossip", id)),
+        }
+    }
+    Ok(peers)
+}
+
+/// Majority quorum for the nominal committee: an epoch-changing reshare must involve more than
+/// half the committee so two disjoint subsets can never fork divergent epochs (split-brain).
+fn majority(total: usize) -> usize {
+    total / 2 + 1
 }
 
 /// Run distributed genesis DKG: all N nodes jointly generate the master (no dealer). On
@@ -290,26 +353,46 @@ async fn run_genesis(
 /// Recovering-node side of reshare recovery: trigger the live committee to reshare and
 /// rejoin as a `RefreshParticipant`, coming out with a fresh, consistent share of the same
 /// master. The survivors act as dealers (see `run_reshare_dealer`); the master is preserved.
-async fn run_reshare_recovery(
-    state: &AppState,
-    own_id: u32,
-    peers: Vec<SessionPeer>,
-    threshold: usize,
-    total: usize,
-) -> Result<()> {
+async fn run_reshare_recovery(state: &AppState, m: Membership) -> Result<()> {
+    let own_id = m.own_id;
+    let threshold = m.threshold;
+    let total = m.total;
+
+    // Dealers = the live share-holders (epoch > 0). A dead / shardless member is simply not a
+    // dealer — we do NOT wait for full membership (issue #4). Need >= threshold to reconstruct
+    // the master, and a majority of the committee participating (dealers + this recovering
+    // node) so two disjoint subsets can't fork divergent epochs (split-brain).
+    let dealers = m.live_dealers();
+    if dealers.len() < threshold {
+        return Err(anyhow!(
+            "cannot recover yet: {} live share-holders discovered, need >= threshold {}",
+            dealers.len(),
+            threshold
+        ));
+    }
+    let participants = dealers.len() + 1; // + this recovering node
+    if participants < majority(total) {
+        return Err(anyhow!(
+            "cannot recover yet: {} participants, need a majority ({}) of {} to avoid split-brain",
+            participants,
+            majority(total),
+            total
+        ));
+    }
+
     // New polynomial epoch: strictly above whatever the live committee currently holds
     // (learned via gossip). All participants stamp their refreshed share with this, so the
     // recovered node lands on the same epoch as the dealers rather than a stale one.
     let new_epoch = state.known_epoch().await + 1;
     let nonce = chrono::Utc::now().timestamp();
     let session_id = format!("reshare:{}:{}:{}", state.config.tapp.app_id, new_epoch, nonce);
-    let mut dealer_ids: Vec<u32> = peers.iter().map(|p| p.id).collect();
+    let mut dealer_ids: Vec<u32> = dealers.iter().map(|p| p.id).collect();
     dealer_ids.sort_unstable();
 
-    // Trigger each survivor to participate as a dealer.
+    // Trigger each live dealer to participate.
     let ts = chrono::Utc::now().timestamp();
     let sig = sign_request(&state.signing_key.private_key, "StartReshare", ts)?;
-    for peer in &peers {
+    for peer in &dealers {
         if let Err(e) = crate::grpc::send_start_reshare(
             &peer.grpc_url,
             &session_id,
@@ -333,7 +416,8 @@ async fn run_reshare_recovery(
         RefreshParticipant::<DkgGroup>::new(NonZeroUsize::new(own_id as usize).unwrap(), params)
             .map_err(|e| anyhow!("reshare (recovering) participant init: {:?}", e))?;
 
-    let (share, pk) = run_session(state, &session_id, participant, &peers, DKG_ROUND_TIMEOUT).await?;
+    // Session peers = the dealers only (the recovering node exchanges rounds with them).
+    let (share, pk) = run_session(state, &session_id, participant, &dealers, DKG_ROUND_TIMEOUT).await?;
     let sk_share = gennaro_share_to_blsful(own_id as usize, share);
     *state.shard.write().await = Some(ShardState {
         shard_index: own_id,
@@ -353,12 +437,41 @@ async fn run_reshare_recovery(
 pub async fn run_reshare_dealer(
     state: &AppState,
     session_id: String,
+    recovering_id: u32,
     dealer_ids: Vec<u32>,
     new_epoch: u64,
 ) -> Result<()> {
-    let (own_id, peers, threshold, total) = assemble_participants(state)
-        .await?
-        .ok_or_else(|| anyhow!("reshare dealer: full cluster membership not available"))?;
+    let threshold = state.config.cluster.threshold as usize;
+    let total = state.config.cluster.total_nodes as usize;
+
+    // Our participant id = position in the on-chain nodeList.
+    let node_list = get_signer_addresses(
+        &state.config.chain.rpc_url,
+        &state.config.chain.contract_address,
+        &state.config.tapp.app_id,
+    )
+    .await
+    .map_err(|e| anyhow!("nodeList lookup failed: {}", e))?;
+    let own_id = node_list
+        .iter()
+        .position(|a| a.0 == state.signing_key.eth_address)
+        .map(|p| p as u32 + 1)
+        .ok_or_else(|| anyhow!("reshare dealer: this node is not in the nodeList"))?;
+
+    let own_index = dealer_ids
+        .iter()
+        .position(|id| *id == own_id)
+        .ok_or_else(|| anyhow!("reshare dealer: own id {} not in dealer set", own_id))?;
+
+    // Monotonic epoch: never reshare backwards into an epoch we've already passed.
+    let cur_epoch = state.shard.read().await.as_ref().map(|s| s.epoch).unwrap_or(0);
+    if new_epoch <= cur_epoch {
+        return Err(anyhow!(
+            "reshare dealer: target epoch {} not ahead of current {}",
+            new_epoch,
+            cur_epoch
+        ));
+    }
 
     let own_share_bytes = state
         .shard
@@ -370,12 +483,17 @@ pub async fn run_reshare_dealer(
         .clone();
     let own_scalar = blsful_share_scalar(&share_from_bytes(&own_share_bytes)?);
 
+    // Session participants = the dealer set plus the recovering node (0 = pure refresh, no
+    // recovering node). Resolve exactly those from gossip — NOT the full committee, so an
+    // absent member doesn't stall the session.
+    let mut participant_ids = dealer_ids.clone();
+    if recovering_id != 0 {
+        participant_ids.push(recovering_id);
+    }
+    let peers = resolve_peers(state, &participant_ids, own_id).await?;
+
     let dealer_scalars: Vec<DkgScalar> =
         dealer_ids.iter().map(|id| DkgScalar::from(*id as u64)).collect();
-    let own_index = dealer_ids
-        .iter()
-        .position(|id| *id == own_id)
-        .ok_or_else(|| anyhow!("reshare dealer: own id {} not in dealer set", own_id))?;
 
     let params = Parameters::<DkgGroup>::new(
         NonZeroUsize::new(threshold).ok_or_else(|| anyhow!("threshold must be > 0"))?,
@@ -423,14 +541,25 @@ pub async fn trigger_refresh(state: &AppState) -> Result<()> {
     if state.shard.read().await.is_none() {
         return Err(anyhow!("cannot refresh: this node has no share"));
     }
-    let (own_id, peers, _t, _n) = assemble_participants(state)
+    let m = assemble_participants(state)
         .await?
-        .ok_or_else(|| anyhow!("refresh: full cluster membership not available"))?;
+        .ok_or_else(|| anyhow!("refresh: nodeList not yet at configured size"))?;
+    // Refresh is proactive and can wait: require the WHOLE committee healthy so no node is
+    // left behind on a stale polynomial. If a member is permanently down, resize it out first,
+    // then refresh the healthy committee.
+    if !m.all_discovered {
+        return Err(anyhow!(
+            "refresh requires all {} members healthy; some are not discovered — wait or resize",
+            m.total
+        ));
+    }
+    let own_id = m.own_id;
 
     // Dealer set = the entire committee (every node contributes its share).
-    let mut dealer_ids: Vec<u32> = peers.iter().map(|p| p.id).collect();
+    let mut dealer_ids: Vec<u32> = m.peers.iter().map(|p| p.id).collect();
     dealer_ids.push(own_id);
     dealer_ids.sort_unstable();
+    let peers = m.peers;
 
     let new_epoch = state.known_epoch().await + 1;
     let nonce = chrono::Utc::now().timestamp();
@@ -456,7 +585,7 @@ pub async fn trigger_refresh(state: &AppState) -> Result<()> {
     }
 
     info!(own_id, epoch = new_epoch, session = %session_id, "proactive refresh started");
-    run_reshare_dealer(state, session_id, dealer_ids, new_epoch).await
+    run_reshare_dealer(state, session_id, 0, dealer_ids, new_epoch).await
 }
 
 /// Background cluster formation, run once after the servers + gossip start.
@@ -473,11 +602,11 @@ pub async fn form_cluster(state: AppState) {
             return;
         }
 
-        // Wait until the full committee is registered on-chain AND discovered via gossip.
-        let (own_id, peers, threshold, total) = match assemble_participants(&state).await {
-            Ok(Some(p)) => p,
+        // Assemble whoever is registered on-chain + discovered via gossip (may be a subset).
+        let m = match assemble_participants(&state).await {
+            Ok(Some(m)) => m,
             Ok(None) => {
-                info!("waiting for full cluster membership (all nodes registered + discovered)…");
+                info!("waiting for the on-chain nodeList to reach the configured size…");
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -494,13 +623,20 @@ pub async fn form_cluster(state: AppState) {
                 Ok(())
             }
             Ok(JoinResult::NoSeedReachable) => {
-                info!(own_id, total, threshold, "fresh cluster — running genesis DKG");
-                run_genesis(&state, own_id, peers, threshold, total).await
+                // Genesis is all-or-nothing: only start once every member is discovered.
+                if !m.all_discovered {
+                    info!("fresh cluster — waiting for all members before genesis DKG");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                info!(own_id = m.own_id, total = m.total, threshold = m.threshold, "fresh cluster — running genesis DKG");
+                run_genesis(&state, m.own_id, m.peers, m.threshold, m.total).await
             }
             Ok(JoinResult::SeedReachableDeclined) => {
-                // Established cluster, no local share → recover via reshare (never regenerate).
-                info!(own_id, "cluster established — recovering our share via reshare");
-                run_reshare_recovery(&state, own_id, peers, threshold, total).await
+                // Established cluster, no local share → recover via reshare from any
+                // >= threshold live share-holders (issue #4: do NOT require full membership).
+                info!(own_id = m.own_id, "cluster established — recovering our share via reshare");
+                run_reshare_recovery(&state, m).await
             }
             Err(e) => Err(anyhow!("cluster probe failed: {}", e)),
         };
