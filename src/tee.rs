@@ -47,14 +47,31 @@ async fn fetch_grpc(cfg: &TappConfig) -> Result<NodeKey> {
     }
     use tapp_service::tapp_service_client::TappServiceClient;
     use tapp_service::GetAppSecretKeyRequest;
-    use tonic::transport::Channel;
+    use tonic::transport::{Channel, Endpoint, Uri};
 
-    let url = cfg.tapp_url();
-    let channel = Channel::from_shared(url.clone())
-        .map_err(|e| anyhow!("invalid tapp-server URL {}: {}", url, e))?
-        .connect()
-        .await
-        .map_err(|e| anyhow!("cannot connect to tapp-server at {}: {}", url, e))?;
+    // Local tapp-server: prefer a Unix domain socket when configured (local IPC,
+    // no host.docker.internal), otherwise dial TCP (tapp_ip:tapp_port).
+    let channel = if let Some(sock) = &cfg.tapp_socket {
+        let path = sock.clone();
+        // The URI is an unused placeholder — routing goes through the connector.
+        Endpoint::try_from("http://[::]:50051")
+            .map_err(|e| anyhow!("internal: bad placeholder endpoint: {}", e))?
+            .connect_with_connector(tower::service_fn(move |_: Uri| {
+                let path = path.clone();
+                async move {
+                    Ok::<_, std::io::Error>(tokio::net::UnixStream::connect(&path).await?)
+                }
+            }))
+            .await
+            .map_err(|e| anyhow!("cannot connect to tapp-server socket {}: {}", sock, e))?
+    } else {
+        let url = cfg.tapp_url();
+        Channel::from_shared(url.clone())
+            .map_err(|e| anyhow!("invalid tapp-server URL {}: {}", url, e))?
+            .connect()
+            .await
+            .map_err(|e| anyhow!("cannot connect to tapp-server at {}: {}", url, e))?
+    };
 
     let mut client = TappServiceClient::new(channel);
     let mut last_err = anyhow!("GetAppSecretKey never attempted");
