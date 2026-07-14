@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -301,7 +301,12 @@ pub async fn get_dprf_partial(
     use tonic::metadata::MetadataValue;
     use tonic::transport::Channel;
 
+    // Bound both the TCP connect and each request so an unreachable/black-hole peer
+    // (SYN dropped → connect would otherwise block for the OS SYN timeout) fails fast
+    // instead of stalling the whole derivation.
     let channel = Channel::from_shared(peer_url.to_string())?
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(3))
         .connect()
         .await?;
 
@@ -425,51 +430,51 @@ pub async fn collect_and_dprf(
     let sig = sign_request(&state.signing_key.private_key, "GetDprfPartial", timestamp)
         .map_err(|e| KmsError::CryptoError(e.to_string()))?;
 
+    let threshold = state.config.cluster.threshold as usize;
+
+    // Own partial is always valid; collect peer partials until we have `threshold` of them,
+    // then STOP. A dead node must not affect normal use: we never wait for stragglers once
+    // enough valid partials are in — pending peer futures (incl. an unreachable one still
+    // connecting) are simply dropped/cancelled when this returns.
+    let mut partials = vec![own_partial];
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(own.shard_index);
+
     let peer_urls = state.peer_urls().await;
-    let peer_futures: Vec<_> = peer_urls
+    let mut peer_futures: FuturesUnordered<_> = peer_urls
         .iter()
         .map(|url| {
             get_dprf_partial(url, app_id, material, &sig, timestamp, &state.signing_key.private_key)
         })
         .collect();
 
-    let peer_results = join_all(peer_futures).await;
-
-    let mut collected: Vec<(u32, Vec<u8>)> =
-        vec![(own.shard_index, partial_to_bytes(&own_partial))];
-    for result in peer_results {
-        match result {
-            Ok((idx, bytes)) => collected.push((idx, bytes)),
-            Err(e) => tracing::warn!(error = %e, "peer partial collection failed"),
+    while partials.len() < threshold {
+        match peer_futures.next().await {
+            // Dedup by source shard index: stale peer_table entries can yield the same node
+            // twice, which would feed duplicate Lagrange identifiers into the combine.
+            Some(Ok((idx, bytes))) => {
+                if !seen.insert(idx) {
+                    continue;
+                }
+                // Parse best-effort: a peer whose gRPC + ECIES succeed can still return an
+                // empty/malformed payload. Discard it individually (don't count it toward
+                // the threshold) rather than aborting — tolerate up to n - threshold bad nodes.
+                match partial_from_bytes(&bytes) {
+                    Ok(p) => partials.push(p),
+                    Err(e) => tracing::warn!(shard_index = idx, error = %e, "discarding malformed partial"),
+                }
+            }
+            Some(Err(e)) => tracing::warn!(error = %e, "peer partial collection failed"),
+            // No more peers to hear from and still short of threshold.
+            None => break,
         }
     }
 
-    // Dedup by source shard index: stale peer_table entries can yield the same node twice,
-    // which would feed duplicate Lagrange identifiers into the combine.
-    let mut seen = std::collections::HashSet::new();
-    collected.retain(|(idx, _)| seen.insert(*idx));
-
-    // Parse partials best-effort: a peer whose gRPC call and ECIES decrypt succeed can still
-    // return an empty/malformed payload. Discard those individually (rather than aborting the
-    // whole derivation) so a single faulty node cannot deny service — the threshold model is
-    // supposed to tolerate up to n - threshold bad nodes. The count check below uses only the
-    // partials that actually parsed.
-    let partials: Vec<_> = collected
-        .iter()
-        .filter_map(|(idx, bytes)| match partial_from_bytes(bytes) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::warn!(shard_index = idx, error = %e, "discarding malformed partial");
-                None
-            }
-        })
-        .collect();
-
-    if partials.len() < state.config.cluster.threshold as usize {
+    if partials.len() < threshold {
         return Err(KmsError::CryptoError(format!(
             "not enough valid partials: got {}, need {}",
             partials.len(),
-            state.config.cluster.threshold
+            threshold
         )));
     }
 
