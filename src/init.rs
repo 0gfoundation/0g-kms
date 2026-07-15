@@ -220,6 +220,17 @@ impl Membership {
     fn live_dealers(&self) -> Vec<SessionPeer> {
         self.peers.iter().filter(|p| p.epoch > 0).cloned().collect()
     }
+
+    /// Reshare dealers MUST all sit on one polynomial: take only the live share-holders at
+    /// the LEADING epoch (max among live holders). Mixing a stale holder in (live test: an
+    /// epoch-3 node1 among epoch-4 dealers) makes Lagrange reconstruct a different intercept
+    /// → the "group pubkey changed" guard aborts every session. A stale live holder is not a
+    /// dealer; it catches up via the fall-behind watchdog instead.
+    fn leading_dealers(&self) -> Vec<SessionPeer> {
+        let dealers = self.live_dealers();
+        let leading = dealers.iter().map(|p| p.epoch).max().unwrap_or(0);
+        dealers.into_iter().filter(|p| p.epoch == leading).collect()
+    }
 }
 
 /// Assemble the committee from chain + gossip. Returns `None` only while the on-chain nodeList
@@ -505,11 +516,13 @@ async fn run_reshare_recovery(state: &AppState, m: Membership) -> Result<()> {
     let threshold = m.threshold;
     let total = m.total;
 
-    // Dealers = the live share-holders (epoch > 0). A dead / shardless member is simply not a
-    // dealer — we do NOT wait for full membership (issue #4). Need >= threshold to reconstruct
-    // the master, and a majority of the committee participating (dealers + this recovering
-    // node) so two disjoint subsets can't fork divergent epochs (split-brain).
-    let dealers = m.live_dealers();
+    // Dealers = the live share-holders at the LEADING epoch (single polynomial — a stale live
+    // holder as dealer would corrupt the reconstruction; it catches up via the watchdog
+    // instead). A dead / shardless member is simply not a dealer — we do NOT wait for full
+    // membership (issue #4). Need >= threshold to reconstruct the master, and a majority of
+    // the committee participating (dealers + this recovering node) so two disjoint subsets
+    // can't fork divergent epochs (split-brain).
+    let dealers = m.leading_dealers();
     if dealers.len() < threshold {
         return Err(anyhow!(
             "cannot recover yet: {} live share-holders discovered, need >= threshold {}",
@@ -567,6 +580,15 @@ async fn run_reshare_recovery(state: &AppState, m: Membership) -> Result<()> {
     let (share, pk) = run_session(state, &session_id, participant, &dealers, DKG_ROUND_TIMEOUT).await?;
     let sk_share = gennaro_share_to_blsful(own_id as usize, share);
     let pk_bytes = pk.to_bytes().as_ref().to_vec();
+    // Master must be preserved: if we already know the group pubkey (catch-up rejoin, or a
+    // sealed reload preceded this), refuse a session that reconstructed a different one.
+    if let Some(known) = state.group_pubkey.read().await.as_ref() {
+        if *known != pk_bytes {
+            return Err(anyhow!(
+                "reshare recovery changed the group public key — aborting to avoid corruption"
+            ));
+        }
+    }
     store_share(
         state,
         ShardState {
@@ -711,6 +733,26 @@ pub async fn trigger_refresh(state: &AppState) -> Result<()> {
     }
     let own_id = m.own_id;
 
+    // All dealers must sit on ONE polynomial: refuse a mixed-epoch committee up front with a
+    // clear message instead of running a session that mixes polynomials and trips the
+    // "group pubkey changed" abort. Stragglers catch up automatically (fall-behind watchdog,
+    // ~2 min) — just retry after they converge.
+    let own_epoch = state.shard.read().await.as_ref().map(|s| s.epoch).unwrap_or(0);
+    let mixed: Vec<String> = m
+        .peers
+        .iter()
+        .filter(|p| p.epoch != own_epoch)
+        .map(|p| format!("id{}@epoch{}", p.id, p.epoch))
+        .collect();
+    if !mixed.is_empty() {
+        return Err(anyhow!(
+            "refresh requires a single epoch across the committee (own epoch {}), but: {} — \
+             stragglers re-sync automatically; retry shortly",
+            own_epoch,
+            mixed.join(", ")
+        ));
+    }
+
     // Dealer set = the entire committee (every node contributes its share).
     let mut dealer_ids: Vec<u32> = m.peers.iter().map(|p| p.id).collect();
     dealer_ids.push(own_id);
@@ -759,10 +801,19 @@ pub async fn form_cluster(state: AppState) {
         try_reload_sealed(&state).await;
     }
 
+    // Subset-recovery settle window: when some committee member is NOT yet discovered, give
+    // discovery this long before recovering from the live subset. Recovering the instant
+    // `threshold` dealers appear (live test) excluded a live-but-not-yet-discovered holder
+    // from the reshare, stranding it on the old epoch. A genuinely dead node just delays
+    // recovery by this window, nothing more.
+    const SUBSET_SETTLE: Duration = Duration::from_secs(60);
+    let mut subset_wait_since: Option<std::time::Instant> = None;
+
     loop {
-        // Done once we hold a share (genesis/recovery/sealed-reload succeeded).
+        // Formed once we hold a share (genesis/recovery/sealed-reload) — then switch to the
+        // fall-behind watchdog below.
         if state.shard.read().await.is_some() {
-            return;
+            break;
         }
 
         // Assemble whoever is registered on-chain + discovered via gossip (may be a subset).
@@ -796,8 +847,25 @@ pub async fn form_cluster(state: AppState) {
                 run_genesis(&state, m.own_id, m.peers, m.threshold, m.total).await
             }
             Ok(JoinResult::SeedReachableDeclined) => {
-                // Established cluster, no local share → recover via reshare from any
-                // >= threshold live share-holders (issue #4: do NOT require full membership).
+                // Established cluster, no local share → recover via reshare. Prefer FULL
+                // membership (all live holders advance together, nobody is stranded); fall
+                // back to the live subset only after the settle window, so a merely
+                // not-yet-discovered live holder isn't left behind on the old epoch.
+                if !m.all_discovered {
+                    let since = *subset_wait_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() < SUBSET_SETTLE {
+                        info!(
+                            "cluster established — waiting for remaining members before \
+                             recovering (subset fallback in {:?})",
+                            SUBSET_SETTLE.saturating_sub(since.elapsed())
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    info!(own_id = m.own_id, "settle window elapsed — recovering from the live subset");
+                } else {
+                    subset_wait_since = None;
+                }
                 info!(own_id = m.own_id, "cluster established — recovering our share via reshare");
                 run_reshare_recovery(&state, m).await
             }
@@ -806,11 +874,59 @@ pub async fn form_cluster(state: AppState) {
 
         // Retry on failure: nodes register/boot at slightly different times, so a genesis or
         // reshare round can time out before every participant is in the session. Keep retrying
-        // until the whole committee lines up and one attempt succeeds (then the top-of-loop
-        // shard check returns).
+        // until the whole committee lines up and one attempt succeeds.
         if let Err(e) = attempt {
             tracing::warn!(error = %e, "cluster formation attempt failed; retrying in 10s");
             tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
+
+    fall_behind_watchdog(state).await;
+}
+
+/// Fall-behind watchdog: a RUNNING node that holds a share can still be left on a stale
+/// polynomial — e.g. a subset recovery fired before this node was discovered (live test:
+/// node1 stranded at epoch 3 while {2,3,4} advanced to 4). A stale share silently stops
+/// contributing to derives (epoch bucketing) and blocks refresh (mixed-epoch dealers), and
+/// nothing else would ever trigger a re-sync. Detect `cluster epoch > own epoch` via gossip
+/// (two consecutive checks, to ignore the transient skew while a reshare is committing) and
+/// catch up by rejoining the current epoch as a RefreshParticipant — the master-preservation
+/// guard in run_reshare_recovery protects the swap.
+async fn fall_behind_watchdog(state: AppState) {
+    // Stagger checks per node id so multiple stragglers don't fire concurrent catch-ups.
+    let stagger = (state.signing_key.eth_address[19] as u64) % 23;
+    let mut behind_checks = 0u32;
+    loop {
+        tokio::time::sleep(Duration::from_secs(45 + stagger)).await;
+
+        let own_epoch = match state.shard.read().await.as_ref() {
+            Some(s) => s.epoch,
+            None => continue,
+        };
+        let cluster_epoch = state.known_epoch().await;
+        if cluster_epoch <= own_epoch {
+            behind_checks = 0;
+            continue;
+        }
+        behind_checks += 1;
+        if behind_checks < 2 {
+            continue; // transient skew while a reshare commits — confirm on the next check
+        }
+        behind_checks = 0;
+
+        tracing::warn!(
+            own_epoch,
+            cluster_epoch,
+            "share is behind the cluster epoch — catching up via reshare rejoin"
+        );
+        match assemble_participants(&state).await {
+            Ok(Some(m)) => {
+                if let Err(e) = run_reshare_recovery(&state, m).await {
+                    tracing::warn!(error = %e, "catch-up rejoin failed; will retry");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "catch-up membership assembly failed"),
         }
     }
 }
