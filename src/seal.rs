@@ -16,10 +16,17 @@
 //! Confidentiality of the share at rest comes from the ECIES envelope (the TEE key), NOT from
 //! the disk — the blob may live on ordinary host storage.
 //!
-//! ## File format (v1) — canonical & versioned
+//! ## Transport (v1) — canonical & versioned
+//!
+//! The sealed share is a **base64url string** carried in an env var into the container
+//! (`KMS_SEALED_SHARE`) and emitted back out on every seal as a `SEALED_SHARE=<b64url>` log
+//! line (safe — it is ciphertext, useless without this TEE's key). The deploy pipeline captures
+//! the latest from the logs and re-injects it on the next start. No durable disk is assumed.
+//! Absent env → the operator is signalling a deliberate fresh start (they know the master
+//! changed) → the node rejoins/genesis-es anew.
 //!
 //! ```text
-//! file = MAGIC(4) ‖ ENVELOPE_VERSION(1) ‖ ECIES(own_uncompressed_pubkey, serde_bare(Record))
+//! blob = MAGIC(4) ‖ ENVELOPE_VERSION(1) ‖ ECIES(own_uncompressed_pubkey, serde_bare(Record))
 //!
 //! MAGIC            = b"KMSS"        // KMS Sealed Share
 //! ENVELOPE_VERSION = 0x01           // cleartext, so a future envelope change is detectable
@@ -41,6 +48,8 @@
 //! share is discarded and the node rejoins.
 
 use anyhow::{anyhow, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{ecies_decrypt, ecies_encrypt};
@@ -73,37 +82,26 @@ impl SealedShareV1 {
     }
 }
 
-/// Seal `rec` to `path`, encrypted to `own_pubkey` (uncompressed secp256k1, 65 bytes).
-/// Written atomically (tmp + rename) so a crash mid-write can't leave a truncated blob.
-pub fn seal(path: &str, own_pubkey: &[u8], rec: &SealedShareV1) -> Result<()> {
+/// Seal `rec` into the raw blob bytes, encrypted to `own_pubkey` (uncompressed secp256k1).
+pub fn seal_to_bytes(own_pubkey: &[u8], rec: &SealedShareV1) -> Result<Vec<u8>> {
     let payload = serde_bare::to_vec(rec).map_err(|e| anyhow!("seal serialize: {}", e))?;
     let ct = ecies_encrypt(own_pubkey, &payload).map_err(|e| anyhow!("seal encrypt: {}", e))?;
-
     let mut buf = Vec::with_capacity(5 + ct.len());
     buf.extend_from_slice(&MAGIC);
     buf.push(ENVELOPE_VERSION);
     buf.extend_from_slice(&ct);
-
-    let tmp = format!("{}.tmp", path);
-    std::fs::write(&tmp, &buf).map_err(|e| anyhow!("seal write {}: {}", tmp, e))?;
-    std::fs::rename(&tmp, path).map_err(|e| anyhow!("seal rename -> {}: {}", path, e))?;
-    Ok(())
+    Ok(buf)
 }
 
-/// Read + unseal the record at `path` with `own_privkey`.
+/// Unseal a raw blob with `own_privkey`.
 ///
-/// Returns `Ok(None)` (NOT an error) for every "no usable share, just rejoin" case: file
-/// absent, foreign/old magic or envelope, or ECIES decrypt failure (a DIFFERENT TEE identity —
-/// the crash-vs-restart signal). Returns `Err` only on genuine corruption of an otherwise-ours
-/// record (decryptable but unparseable), which the caller should log and then rejoin.
-pub fn unseal(path: &str, own_privkey: &[u8; 32]) -> Result<Option<SealedShareV1>> {
-    let buf = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(anyhow!("unseal read {}: {}", path, e)),
-    };
+/// Returns `Ok(None)` (NOT an error) for every "no usable share, just rejoin" case: foreign /
+/// old magic or envelope, or ECIES decrypt failure (a DIFFERENT TEE identity — the
+/// crash-vs-restart signal). `Err` only on genuine corruption of an otherwise-ours record
+/// (decryptable but unparseable), which the caller should log and then rejoin.
+pub fn unseal_from_bytes(buf: &[u8], own_privkey: &[u8; 32]) -> Result<Option<SealedShareV1>> {
     if buf.len() < 5 || buf[0..4] != MAGIC {
-        return Ok(None); // not one of our sealed files
+        return Ok(None); // not one of our sealed blobs
     }
     if buf[4] != ENVELOPE_VERSION {
         return Ok(None); // unknown envelope version — don't guess
@@ -122,17 +120,28 @@ pub fn unseal(path: &str, own_privkey: &[u8; 32]) -> Result<Option<SealedShareV1
     Ok(Some(rec))
 }
 
+/// Seal to a base64url (no-pad) string for env/log transport.
+pub fn seal_b64(own_pubkey: &[u8], rec: &SealedShareV1) -> Result<String> {
+    Ok(URL_SAFE_NO_PAD.encode(seal_to_bytes(own_pubkey, rec)?))
+}
+
+/// Unseal from a base64url string (as carried in `KMS_SEALED_SHARE`). A malformed base64
+/// string yields `Ok(None)` — treat as "no usable share" and rejoin.
+pub fn unseal_b64(s: &str, own_privkey: &[u8; 32]) -> Result<Option<SealedShareV1>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    match URL_SAFE_NO_PAD.decode(s) {
+        Ok(buf) => unseal_from_bytes(&buf, own_privkey),
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::pubkey_from_private;
-
-    fn tmp_path(tag: &str) -> String {
-        std::env::temp_dir()
-            .join(format!("kms-seal-test-{}-{}.bin", tag, std::process::id()))
-            .to_string_lossy()
-            .into_owned()
-    }
 
     fn rec() -> SealedShareV1 {
         SealedShareV1::new(3, 7, vec![0xAAu8; 48], vec![0x11u8; 40])
@@ -142,11 +151,11 @@ mod tests {
     fn seal_unseal_roundtrip_same_identity() {
         let sk = [7u8; 32];
         let pk = pubkey_from_private(&sk).unwrap();
-        let path = tmp_path("roundtrip");
-        seal(&path, &pk, &rec()).unwrap();
-        let got = unseal(&path, &sk).unwrap().unwrap();
+        let s = seal_b64(&pk, &rec()).unwrap();
+        // base64url string: env/log safe (no +, /, =).
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        let got = unseal_b64(&s, &sk).unwrap().unwrap();
         assert_eq!(got, rec(), "same TEE identity unseals the exact record");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -154,42 +163,39 @@ mod tests {
         // A different TEE identity (crash → new signer) must NOT be able to unseal.
         let sk = [7u8; 32];
         let pk = pubkey_from_private(&sk).unwrap();
-        let path = tmp_path("wrongkey");
-        seal(&path, &pk, &rec()).unwrap();
+        let s = seal_b64(&pk, &rec()).unwrap();
         let other = [9u8; 32];
         assert!(
-            unseal(&path, &other).unwrap().is_none(),
+            unseal_b64(&s, &other).unwrap().is_none(),
             "a different key must yield None (→ rejoin), never the share"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn unseal_absent_or_foreign_is_none() {
+    fn unseal_empty_or_foreign_is_none() {
         let sk = [7u8; 32];
-        assert!(unseal(&tmp_path("absent-xyz"), &sk).unwrap().is_none());
-
-        let path = tmp_path("foreign");
-        std::fs::write(&path, b"not a kms sealed file").unwrap();
-        assert!(unseal(&path, &sk).unwrap().is_none(), "foreign magic → None");
-        let _ = std::fs::remove_file(&path);
+        assert!(unseal_b64("", &sk).unwrap().is_none(), "empty env → None");
+        assert!(unseal_b64("   ", &sk).unwrap().is_none(), "blank env → None");
+        assert!(
+            unseal_b64("bm90IGEga21zIHNlYWw", &sk).unwrap().is_none(),
+            "foreign magic → None"
+        );
+        assert!(
+            unseal_b64("!!!not base64!!!", &sk).unwrap().is_none(),
+            "malformed base64 → None"
+        );
     }
 
     #[test]
     fn tampered_ciphertext_does_not_yield_share() {
         let sk = [7u8; 32];
         let pk = pubkey_from_private(&sk).unwrap();
-        let path = tmp_path("tamper");
-        seal(&path, &pk, &rec()).unwrap();
-        let mut buf = std::fs::read(&path).unwrap();
+        let mut buf = seal_to_bytes(&pk, &rec()).unwrap();
         let last = buf.len() - 1;
         buf[last] ^= 0xFF; // flip a ciphertext byte
-        std::fs::write(&path, &buf).unwrap();
-        // AEAD must reject: either None (decrypt failed) or a hard error — never the record.
-        match unseal(&path, &sk) {
+        match unseal_from_bytes(&buf, &sk) {
             Ok(None) | Err(_) => {}
             Ok(Some(_)) => panic!("tampered blob must never yield a usable share"),
         }
-        let _ = std::fs::remove_file(&path);
     }
 }
