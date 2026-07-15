@@ -316,6 +316,83 @@ fn majority(total: usize) -> usize {
     total / 2 + 1
 }
 
+/// Store a freshly-obtained share + group pubkey, and emit the sealed base64 blob to the log
+/// (`SEALED_SHARE=<b64url>`) so the deploy pipeline can re-inject it via `KMS_SEALED_SHARE` on
+/// the next restart. The blob is ECIES-sealed to this node's own TEE key — safe to log.
+async fn store_share(state: &AppState, shard: ShardState, group_pubkey: Vec<u8>) {
+    match crate::crypto::pubkey_from_private(&state.signing_key.private_key) {
+        Ok(pk) => {
+            let rec = crate::seal::SealedShareV1::new(
+                shard.shard_index,
+                shard.epoch,
+                group_pubkey.clone(),
+                shard.shard_bytes.clone(),
+            );
+            match crate::seal::seal_b64(&pk, &rec) {
+                Ok(b64) => info!(epoch = shard.epoch, "SEALED_SHARE={}", b64),
+                Err(e) => tracing::warn!(error = %e, "failed to seal share for persistence"),
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to derive own pubkey for sealing"),
+    }
+    *state.group_pubkey.write().await = Some(group_pubkey);
+    *state.shard.write().await = Some(shard);
+}
+
+/// Boot-time persistence: if `KMS_SEALED_SHARE` is set, unseal it with this node's TEE key and
+/// adopt the share IF it is still current. Returns true if a fresh share was loaded (then
+/// `form_cluster` returns immediately — no rejoin). Absent / wrong-identity / stale → false →
+/// normal genesis/rejoin. A master change is the operator's call: they omit the env to force a
+/// fresh start (clear it on any re-genesis).
+async fn try_reload_sealed(state: &AppState) -> bool {
+    let b64 = match std::env::var("KMS_SEALED_SHARE") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return false, // no blob → operator wants a fresh start
+    };
+    let rec = match crate::seal::unseal_b64(&b64, &state.signing_key.private_key) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            info!("KMS_SEALED_SHARE not usable by this TEE identity — will rejoin");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "sealed share corrupt — will rejoin");
+            return false;
+        }
+    };
+
+    // Freshness: don't adopt a share the cluster has already moved past. Give gossip a moment to
+    // learn peers' epochs (own shard isn't loaded yet, so known_epoch = max peer epoch), then
+    // compare. If we're isolated (no peers) we adopt it — it's our best last-known-good.
+    for _ in 0..6 {
+        if !state.peer_table.read().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    let cluster_epoch = state.known_epoch().await;
+    if rec.epoch < cluster_epoch {
+        info!(
+            share_epoch = rec.epoch,
+            cluster_epoch, "sealed share is stale — discarding and rejoining"
+        );
+        return false;
+    }
+
+    info!(
+        epoch = rec.epoch,
+        shard_index = rec.shard_index,
+        "reloaded sealed share from KMS_SEALED_SHARE (no rejoin needed)"
+    );
+    *state.group_pubkey.write().await = Some(rec.master_id);
+    *state.shard.write().await = Some(ShardState {
+        shard_index: rec.shard_index,
+        shard_bytes: rec.share,
+        epoch: rec.epoch,
+    });
+    true
+}
+
 /// Run distributed genesis DKG: all N nodes jointly generate the master (no dealer). On
 /// success this node holds a share of the shared key and the cluster's group public key.
 async fn run_genesis(
@@ -339,13 +416,17 @@ async fn run_genesis(
     let (share, pk) = run_session(state, &session_id, participant, &peers, DKG_ROUND_TIMEOUT).await?;
 
     let sk_share = gennaro_share_to_blsful(own_id as usize, share);
-    *state.shard.write().await = Some(ShardState {
-        shard_index: own_id,
-        shard_bytes: share_to_bytes(&sk_share),
-        epoch: GENESIS_EPOCH,
-    });
     let pk_bytes = pk.to_bytes().as_ref().to_vec();
-    *state.group_pubkey.write().await = Some(pk_bytes.clone());
+    store_share(
+        state,
+        ShardState {
+            shard_index: own_id,
+            shard_bytes: share_to_bytes(&sk_share),
+            epoch: GENESIS_EPOCH,
+        },
+        pk_bytes.clone(),
+    )
+    .await;
     info!(own_id, epoch = GENESIS_EPOCH, group_pubkey = %hex::encode(&pk_bytes), "genesis DKG complete — share and group public key stored");
     Ok(())
 }
@@ -419,13 +500,17 @@ async fn run_reshare_recovery(state: &AppState, m: Membership) -> Result<()> {
     // Session peers = the dealers only (the recovering node exchanges rounds with them).
     let (share, pk) = run_session(state, &session_id, participant, &dealers, DKG_ROUND_TIMEOUT).await?;
     let sk_share = gennaro_share_to_blsful(own_id as usize, share);
-    *state.shard.write().await = Some(ShardState {
-        shard_index: own_id,
-        shard_bytes: share_to_bytes(&sk_share),
-        epoch: new_epoch,
-    });
     let pk_bytes = pk.to_bytes().as_ref().to_vec();
-    *state.group_pubkey.write().await = Some(pk_bytes.clone());
+    store_share(
+        state,
+        ShardState {
+            shard_index: own_id,
+            shard_bytes: share_to_bytes(&sk_share),
+            epoch: new_epoch,
+        },
+        pk_bytes.clone(),
+    )
+    .await;
     info!(own_id, epoch = new_epoch, group_pubkey = %hex::encode(&pk_bytes), "reshare recovery complete — share repaired, master preserved");
     Ok(())
 }
@@ -521,11 +606,16 @@ pub async fn run_reshare_dealer(
         }
     }
     let sk_share = gennaro_share_to_blsful(own_id as usize, new_share);
-    *state.shard.write().await = Some(ShardState {
-        shard_index: own_id,
-        shard_bytes: share_to_bytes(&sk_share),
-        epoch: new_epoch,
-    });
+    store_share(
+        state,
+        ShardState {
+            shard_index: own_id,
+            shard_bytes: share_to_bytes(&sk_share),
+            epoch: new_epoch,
+        },
+        new_pk_bytes.clone(),
+    )
+    .await;
     info!(own_id, epoch = new_epoch, group_pubkey = %hex::encode(&new_pk_bytes), "reshare dealer complete — share refreshed, master preserved");
     Ok(())
 }
@@ -596,8 +686,15 @@ pub async fn trigger_refresh(state: &AppState) -> Result<()> {
 ///    - a peer is already initialized → **established** → recover our share via reshare.
 ///      DISASTER GATE: an established cluster must NEVER trigger genesis (would fork it).
 pub async fn form_cluster(state: AppState) {
+    // Persistence first: if a valid, current sealed share was injected via KMS_SEALED_SHARE,
+    // adopt it and skip rejoin entirely (this is the only path that works at the threshold
+    // floor, where rejoin is impossible).
+    if state.shard.read().await.is_none() {
+        try_reload_sealed(&state).await;
+    }
+
     loop {
-        // Done once we hold a share (genesis/recovery succeeded, or a future persistent load).
+        // Done once we hold a share (genesis/recovery/sealed-reload succeeded).
         if state.shard.read().await.is_some() {
             return;
         }
