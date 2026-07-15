@@ -6,6 +6,7 @@ mod dkg;
 mod error;
 mod grpc;
 mod init;
+mod seal;
 mod server;
 mod tee;
 
