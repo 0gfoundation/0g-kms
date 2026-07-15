@@ -325,6 +325,25 @@ fn majority(total: usize) -> usize {
     total / 2 + 1
 }
 
+/// Sealed-share knobs: env var overrides the config field (config is the primary,
+/// deploy-friendly channel; env remains for pipeline injection).
+fn sealed_share_blob(state: &AppState) -> Option<String> {
+    std::env::var("KMS_SEALED_SHARE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| state.config.cluster.sealed_share.clone())
+        .filter(|v| !v.trim().is_empty())
+}
+
+fn sealed_share_path(state: &AppState) -> Option<String> {
+    std::env::var("KMS_SEALED_SHARE_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| state.config.cluster.sealed_share_path.clone())
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().to_string())
+}
+
 /// Store a freshly-obtained share + group pubkey, and emit the sealed base64 blob to the log
 /// (`SEALED_SHARE=<b64url>`) so the deploy pipeline can re-inject it via `KMS_SEALED_SHARE` on
 /// the next restart. The blob is ECIES-sealed to this node's own TEE key — safe to log.
@@ -344,11 +363,9 @@ async fn store_share(state: &AppState, shard: ShardState, group_pubkey: Vec<u8>)
                     // KMS_SEALED_SHARE_PATH points at a durable volume — an auto-persisted
                     // file that a restart reloads with zero pipeline involvement.
                     *state.sealed_share.write().await = Some(b64.clone());
-                    if let Ok(path) = std::env::var("KMS_SEALED_SHARE_PATH") {
-                        if !path.trim().is_empty() {
-                            if let Err(e) = crate::seal::write_blob_file(path.trim(), &b64) {
-                                tracing::warn!(error = %e, "failed to persist sealed share to file");
-                            }
+                    if let Some(path) = sealed_share_path(state) {
+                        if let Err(e) = crate::seal::write_blob_file(&path, &b64) {
+                            tracing::warn!(error = %e, "failed to persist sealed share to file");
                         }
                     }
                     info!(epoch = shard.epoch, "SEALED_SHARE={}", b64);
@@ -369,26 +386,27 @@ async fn store_share(state: &AppState, shard: ShardState, group_pubkey: Vec<u8>)
 /// fresh start (clear it on any re-genesis).
 async fn try_reload_sealed(state: &AppState) -> bool {
     // Blob sources, in priority order:
-    //   1. KMS_SEALED_SHARE — explicit operator-injected blob (pipeline capture → env).
-    //   2. KMS_SEALED_SHARE_PATH — file auto-persisted by a previous run on a durable volume.
-    // Neither present → deliberate fresh start (on a re-genesis the operator must omit the
-    // env AND clear the file).
-    let b64 = match std::env::var("KMS_SEALED_SHARE") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => {
-            let from_file = std::env::var("KMS_SEALED_SHARE_PATH")
-                .ok()
-                .filter(|p| !p.trim().is_empty())
-                .and_then(|p| match crate::seal::read_blob_file(p.trim()) {
+    //   1. explicit blob — env KMS_SEALED_SHARE, else config [cluster].sealed_share
+    //      (per-node deploy config is the primary channel; paste the blob there on restart).
+    //   2. persisted file — env KMS_SEALED_SHARE_PATH, else config [cluster].sealed_share_path
+    //      (auto-written by a previous run; useful when the path is on a durable volume).
+    // Neither present → deliberate fresh start (on a re-genesis: omit the blob AND clear the
+    // file).
+    let b64 = match sealed_share_blob(state) {
+        Some(v) => v,
+        None => {
+            let from_file = sealed_share_path(state).and_then(|p| {
+                match crate::seal::read_blob_file(&p) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(error = %e, "sealed share file unreadable — will rejoin");
                         None
                     }
-                });
+                }
+            });
             match from_file {
                 Some(v) => {
-                    info!("loading sealed share from KMS_SEALED_SHARE_PATH file");
+                    info!("loading sealed share from the persisted file");
                     v
                 }
                 None => return false, // no blob anywhere → operator wants a fresh start
