@@ -1,7 +1,11 @@
 use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 
-use blsful::{Bls12381G2Impl, SecretKey, SecretKeyShare, Signature, SignatureSchemes, SignatureShare};
+use blsful::{
+    Bls12381G2Impl, PublicKey, SecretKey, SecretKeyShare, Signature, SignatureSchemes,
+    SignatureShare,
+};
+use hkdf::Hkdf;
 
 use crate::error::KmsError;
 
@@ -71,19 +75,44 @@ pub fn dprf_partial(share: &SecretKeyShare<Bls>, msg: &[u8]) -> Result<Signature
         .map_err(|e| anyhow!("partial sign failed: {:?}", e))
 }
 
-/// Combine ≥ threshold partials into the 32-byte app key. Internally this is in-group
-/// Lagrange interpolation of the partial signatures → σ = s·H(msg); the master is never
-/// assembled. The caller MUST enforce the threshold count (a sub-threshold set of partials
-/// interpolates a *different*, wrong σ rather than erroring).
+/// In-group Lagrange interpolation of the partials → σ = s·H(msg). The master is never
+/// assembled. The caller MUST enforce the threshold count (a sub-threshold set interpolates a
+/// *different*, wrong σ rather than erroring) — and SHOULD `dprf_verify` σ before trusting it,
+/// since `from_shares` cannot tell an honest partial from a garbage one.
+pub fn dprf_sigma(partials: &[SignatureShare<Bls>]) -> Result<Signature<Bls>> {
+    Signature::<Bls>::from_shares(partials).map_err(|e| anyhow!("partial combine failed: {:?}", e))
+}
+
+/// Verify a combined σ against the cluster group public key and derivation message. This is
+/// the guard against a Byzantine/garbage partial: `dprf_sigma` silently yields a WRONG σ if any
+/// partial is bad, so we check σ = s·H(msg) against `group_pubkey` (= s·G, stable across
+/// epochs) before deriving. A failure means the partial set was not all-honest — reject rather
+/// than hand out a wrong key.
+pub fn dprf_verify(sigma: &Signature<Bls>, group_pubkey: &[u8], msg: &[u8]) -> Result<()> {
+    let pk = PublicKey::<Bls>::try_from(group_pubkey)
+        .map_err(|e| anyhow!("invalid group public key: {:?}", e))?;
+    sigma
+        .verify(&pk, msg)
+        .map_err(|e| anyhow!("combined signature failed verification: {:?}", e))
+}
+
+/// Derive the 32-byte app key from σ via HKDF-SHA256 (domain-separated). σ is a uniformly
+/// random group element, but HKDF (extract-then-expand) is the standard KDF and keeps this
+/// consistent with best practice / the pre-DKG path.
+pub fn sigma_to_app_key(sigma: &Signature<Bls>) -> [u8; 32] {
+    let sigma_bytes = Vec::<u8>::from(sigma); // canonical compressed σ point
+    let hk = Hkdf::<Sha256>::new(None, &sigma_bytes);
+    let mut okm = [0u8; 32];
+    hk.expand(KDF_DST, &mut okm)
+        .expect("32 is a valid HKDF-SHA256 output length");
+    okm
+}
+
+/// Combine ≥ threshold partials into the 32-byte app key WITHOUT verification. Convenience for
+/// crypto tests where all partials are honest by construction. Production derivation goes
+/// through `dprf_sigma` + `dprf_verify` + `sigma_to_app_key` (see `grpc::collect_and_dprf`).
 pub fn dprf_combine(partials: &[SignatureShare<Bls>]) -> Result<[u8; 32]> {
-    let sigma = Signature::<Bls>::from_shares(partials)
-        .map_err(|e| anyhow!("partial combine failed: {:?}", e))?;
-    // Canonical, backend-agnostic serialization of the σ point (compressed) → KDF.
-    let sigma_bytes = Vec::<u8>::from(&sigma);
-    let mut h = Sha256::new();
-    h.update(KDF_DST);
-    h.update(&sigma_bytes);
-    Ok(h.finalize().into())
+    Ok(sigma_to_app_key(&dprf_sigma(partials)?))
 }
 
 // ─── Share serialization (wire format for shard distribution + partials) ───────
@@ -333,6 +362,7 @@ mod dkg_tests {
     use super::*;
     use blstrs_plus::{G1Projective, Scalar};
     use ff::Field;
+    use group::GroupEncoding;
     use gennaro_dkg::{Parameters, RefreshParticipant, SecretParticipant};
     use group::Group;
     use std::collections::BTreeMap;
@@ -405,6 +435,45 @@ mod dkg_tests {
         for p in ps.iter_mut() {
             p.round5(&b4).unwrap();
         }
+    }
+
+    #[test]
+    fn dprf_verify_accepts_honest_and_rejects_garbage() {
+        // 2-of-3 genesis → group pubkey (G1) → its canonical bytes are what a node stores and
+        // what dprf_verify checks against.
+        let params = Parameters::<G1Projective>::new(nz(2), nz(3));
+        let mut ps: Vec<_> = (1..=3)
+            .map(|i| SecretParticipant::<G1Projective>::new(nz(i), params).unwrap())
+            .collect();
+        drive(&mut ps);
+        let group_pk_bytes = ps[0].get_public_key().unwrap().to_bytes().as_ref().to_vec();
+        let sh: Vec<(usize, Scalar)> = ps
+            .iter()
+            .map(|p| (p.get_id(), p.get_secret_share().unwrap()))
+            .collect();
+
+        let msg = dprf_message("app", b"m");
+        let partial = |i: usize| dprf_partial(&gennaro_share_to_blsful(sh[i].0, sh[i].1), &msg).unwrap();
+
+        // Honest threshold set → σ verifies against the group pubkey.
+        let honest = [partial(0), partial(1)];
+        let sigma = dprf_sigma(&honest).unwrap();
+        assert!(dprf_verify(&sigma, &group_pk_bytes, &msg).is_ok(), "honest σ must verify");
+
+        // Byzantine set: swap in a partial for a DIFFERENT message (a garbage/wrong partial).
+        // from_shares still yields SOME σ (no error), but it must NOT verify — this is the
+        // guard that turns "silent wrong key" into a hard rejection.
+        let wrong_msg = dprf_message("app", b"garbage");
+        let bad = dprf_partial(&gennaro_share_to_blsful(sh[1].0, sh[1].1), &wrong_msg).unwrap();
+        let poisoned = [partial(0), bad];
+        let bad_sigma = dprf_sigma(&poisoned).unwrap(); // no error…
+        assert!(
+            dprf_verify(&bad_sigma, &group_pk_bytes, &msg).is_err(),
+            "a garbage partial must make σ fail verification, not silently produce a wrong key"
+        );
+
+        // Wrong message against an honest σ also fails (binding).
+        assert!(dprf_verify(&sigma, &group_pk_bytes, &wrong_msg).is_err());
     }
 
     #[test]

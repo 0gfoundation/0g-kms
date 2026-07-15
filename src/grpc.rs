@@ -6,7 +6,8 @@ use tonic::{Request, Response, Status};
 use crate::{
     auth::authenticate,
     crypto::{
-        dprf_combine, dprf_message, dprf_partial, ecies_decrypt, ecies_encrypt,
+        dprf_message, dprf_partial, dprf_sigma, dprf_verify, ecies_decrypt, ecies_encrypt,
+        sigma_to_app_key,
         partial_from_bytes, partial_to_bytes, share_from_bytes, sign_request,
     },
     error::KmsError,
@@ -52,12 +53,16 @@ impl KmsCluster for KmsClusterService {
             .await
             .clone()
             .ok_or_else(|| Status::unavailable("node not initialized"))?;
-        let share = share_from_bytes(&shard.shard_bytes)
-            .map_err(|e| Status::internal(format!("invalid local shard: {}", e)))?;
+        let share = share_from_bytes(&shard.shard_bytes).map_err(|e| {
+            tracing::error!(error = %e, "invalid local shard");
+            Status::internal("local shard unavailable")
+        })?;
 
         let msg = dprf_message(&req.app_id, &req.material);
-        let partial = dprf_partial(&share, &msg)
-            .map_err(|e| Status::internal(format!("partial sign failed: {}", e)))?;
+        let partial = dprf_partial(&share, &msg).map_err(|e| {
+            tracing::error!(error = %e, "partial sign failed");
+            Status::internal("partial signing failed")
+        })?;
 
         let ciphertext = ecies_encrypt(&ctx.caller_pubkey, &partial_to_bytes(&partial))
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -513,7 +518,19 @@ pub async fn collect_and_dprf(
         ))
     })?;
 
-    dprf_combine(&buckets[&epoch]).map_err(|e| KmsError::CryptoError(e.to_string()))
+    // Combine → VERIFY against the group public key → derive. `from_shares` cannot detect a
+    // Byzantine/garbage partial; without this check a bad partial would silently yield a wrong
+    // (but deterministic) key. Verifying σ = s·H(msg) against group_pubkey (= s·G) rejects any
+    // non-all-honest set instead of handing out a wrong key.
+    let sigma = dprf_sigma(&buckets[&epoch]).map_err(|e| KmsError::CryptoError(e.to_string()))?;
+    let group_pubkey = state
+        .group_pubkey
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| KmsError::CryptoError("no group public key to verify against".into()))?;
+    dprf_verify(&sigma, &group_pubkey, &msg).map_err(|e| KmsError::CryptoError(e.to_string()))?;
+    Ok(sigma_to_app_key(&sigma))
 }
 
 // ─── Gossip background task ───────────────────────────────────────────────────
