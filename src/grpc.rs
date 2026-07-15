@@ -65,7 +65,10 @@ impl KmsCluster for KmsClusterService {
         })?;
 
         let ciphertext = ecies_encrypt(&ctx.caller_pubkey, &partial_to_bytes(&partial))
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "partial encryption failed");
+                Status::internal("encryption failed")
+            })?;
 
         Ok(Response::new(EncryptedPartial {
             ciphertext,
@@ -90,7 +93,10 @@ impl KmsCluster for KmsClusterService {
             .ok_or_else(|| Status::unavailable("node not initialized"))?;
 
         let ciphertext = ecies_encrypt(&ctx.caller_pubkey, &shard.shard_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "shard encryption failed");
+                Status::internal("encryption failed")
+            })?;
 
         Ok(Response::new(EncryptedShard {
             ciphertext,
@@ -190,8 +196,10 @@ impl KmsCluster for KmsClusterService {
         let p2p = if msg.p2p.is_empty() {
             Vec::new()
         } else {
-            ecies_decrypt(&self.state.signing_key.private_key, &msg.p2p)
-                .map_err(|e| Status::internal(format!("dkg p2p decrypt failed: {}", e)))?
+            ecies_decrypt(&self.state.signing_key.private_key, &msg.p2p).map_err(|e| {
+                tracing::error!(error = %e, "dkg p2p decrypt failed");
+                Status::internal("p2p decrypt failed")
+            })?
         };
 
         self.state
@@ -263,7 +271,10 @@ impl KmsClusterService {
             &self.state.config.tapp.app_id,
         )
         .await
-        .map_err(|e| Status::internal(format!("getNodeList failed: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "getNodeList failed");
+            Status::internal("membership lookup failed")
+        })?;
 
         let position = node_list
             .iter()
@@ -272,10 +283,15 @@ impl KmsClusterService {
 
         let (shard_index, shard_bytes) = shards
             .get(position)
-            .ok_or_else(|| Status::internal(format!("no shard at position {}", position)))?;
+            .ok_or_else(|| {
+                tracing::error!(position, "no shard at caller's nodeList position");
+                Status::internal("no shard available")
+            })?;
 
-        let ciphertext = ecies_encrypt(caller_pubkey, shard_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let ciphertext = ecies_encrypt(caller_pubkey, shard_bytes).map_err(|e| {
+            tracing::error!(error = %e, "init-shard encryption failed");
+            Status::internal("encryption failed")
+        })?;
 
         Ok(Some(EncryptedShard {
             ciphertext,
