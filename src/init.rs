@@ -338,7 +338,12 @@ async fn store_share(state: &AppState, shard: ShardState, group_pubkey: Vec<u8>)
                 shard.shard_bytes.clone(),
             );
             match crate::seal::seal_b64(&pk, &rec) {
-                Ok(b64) => info!(epoch = shard.epoch, "SEALED_SHARE={}", b64),
+                Ok(b64) => {
+                    // Two capture channels for the deploy pipeline: the log line and
+                    // GET /sealed-share (both carry the same TEE-encrypted blob).
+                    *state.sealed_share.write().await = Some(b64.clone());
+                    info!(epoch = shard.epoch, "SEALED_SHARE={}", b64);
+                }
                 Err(e) => tracing::warn!(error = %e, "failed to seal share for persistence"),
             }
         }
@@ -393,6 +398,8 @@ async fn try_reload_sealed(state: &AppState) -> bool {
         shard_index = rec.shard_index,
         "reloaded sealed share from KMS_SEALED_SHARE (no rejoin needed)"
     );
+    // The adopted blob is also the current sealed share — expose it on /sealed-share.
+    *state.sealed_share.write().await = Some(b64.trim().to_string());
     *state.group_pubkey.write().await = Some(rec.master_id);
     *state.shard.write().await = Some(ShardState {
         shard_index: rec.shard_index,

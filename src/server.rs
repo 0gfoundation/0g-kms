@@ -96,6 +96,10 @@ pub struct AppState {
     /// The cluster's group public key (G1), set after genesis DKG. Serves as the
     /// "genesis has happened" witness and is checked when recovering a share via reshare.
     pub group_pubkey: Arc<RwLock<Option<Vec<u8>>>>,
+    /// Latest sealed share (base64url), refreshed on every share change. Exposed via
+    /// GET /sealed-share so the deploy pipeline can fetch it without grepping logs. It is
+    /// ECIES ciphertext to this node's own TEE key — safe to expose, same as logging it.
+    pub sealed_share: Arc<RwLock<Option<String>>>,
 }
 
 impl AppState {
@@ -108,6 +112,7 @@ impl AppState {
             peer_table: Arc::new(RwLock::new(HashMap::new())),
             dkg_sessions: Arc::new(RwLock::new(HashMap::new())),
             group_pubkey: Arc::new(RwLock::new(None)),
+            sealed_share: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -276,9 +281,61 @@ pub async fn handle_refresh(State(state): State<AppState>) -> impl IntoResponse 
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
+/// GET /peers — this node's view of the cluster: itself + every known peer, with the same
+/// liveness judgement the reshare dealer selection uses (direct contact within the window).
+/// `live_share_holders` counts self (if it holds a share) + live peers with epoch > 0 — i.e.
+/// how far the cluster is from the threshold floor.
+pub async fn handle_peers(State(state): State<AppState>) -> impl IntoResponse {
+    let now = chrono::Utc::now().timestamp();
+    let (own_epoch, own_has_share) = {
+        let s = state.shard.read().await;
+        (s.as_ref().map(|x| x.epoch).unwrap_or(0), s.is_some())
+    };
+    let table = state.peer_table.read().await;
+    let peers: Vec<serde_json::Value> = table
+        .iter()
+        .map(|(addr, p)| {
+            serde_json::json!({
+                "eth_addr": format!("0x{}", hex::encode(addr)),
+                "grpc_url": p.grpc_url,
+                "epoch": p.epoch,
+                "live": p.is_live(now),
+                "last_seen": p.last_seen,
+            })
+        })
+        .collect();
+    let live_share_holders = (own_has_share as usize)
+        + table.values().filter(|p| p.is_live(now) && p.epoch > 0).count();
+
+    Json(serde_json::json!({
+        "self": {
+            "eth_addr": format!("0x{}", hex::encode(state.signing_key.eth_address)),
+            "grpc_url": state.config.cluster.self_url,
+            "epoch": own_epoch,
+            "has_share": own_has_share,
+        },
+        "peers": peers,
+        "threshold": state.config.cluster.threshold,
+        "total_nodes": state.config.cluster.total_nodes,
+        "live_share_holders": live_share_holders,
+    }))
+}
+
+/// GET /sealed-share — the latest sealed share blob (base64url), for the deploy pipeline to
+/// capture and re-inject via KMS_SEALED_SHARE on the next restart. ECIES ciphertext to this
+/// node's own TEE key: unusable by anyone else, so exposing it is as safe as logging it.
+pub async fn handle_sealed_share(State(state): State<AppState>) -> impl IntoResponse {
+    match state.sealed_share.read().await.clone() {
+        Some(b64) => (StatusCode::OK, b64),
+        None => (StatusCode::NOT_FOUND, "no sealed share yet".to_string()),
+    }
+}
+
 pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/app-key", axum::routing::post(handle_app_key))
         .route("/refresh", axum::routing::post(handle_refresh))
+        .route("/peers", axum::routing::get(handle_peers))
+        .route("/sealed-share", axum::routing::get(handle_sealed_share))
         .with_state(state)
 }
