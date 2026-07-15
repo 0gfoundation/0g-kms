@@ -48,7 +48,7 @@ rand = "0.8"
 blsful = "=3.1.0"
 # Shamir/VSS primitives (share repair on the recovery path). Aligned with blsful's vsss-rs;
 # also re-exported as `blsful::vsss_rs` to avoid version skew.
-vsss-rs = "5.1.0"
+vsss-rs = "=5.4.0"
 # Distributed key generation + proactive resharing (Family A: mikelodder7 stack, same
 # lineage as blsful/vsss-rs). Produces scalar shares that bridge into blsful SecretKeyShare.
 # Genesis DKG (no dealer single point) + lost-share recovery/refresh via resharing.
