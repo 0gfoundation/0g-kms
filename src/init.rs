@@ -202,18 +202,21 @@ async fn request_shard_from_peer(
 struct Membership {
     /// This node's 1-based nodeList position / participant id.
     own_id: u32,
-    /// Other nodeList members currently discovered via gossip (pubkey present), each carrying
-    /// its gossiped epoch. Undiscovered (down) members are simply absent from this list.
+    /// Other nodeList members that are discovered (pubkey known) AND currently LIVE (direct
+    /// gossip contact within the liveness window), each carrying its gossiped epoch. Down or
+    /// merely-relayed members are absent from this list — a dead node must never be selected
+    /// into a session (it would stall every round at the barrier).
     peers: Vec<SessionPeer>,
     threshold: usize,
     /// Nominal committee size = `cluster.total_nodes` (NOT the count discovered).
     total: usize,
-    /// True iff every nodeList member besides self is present in `peers` (nobody is down).
+    /// True iff every nodeList member besides self is present in `peers` (everyone alive).
     all_discovered: bool,
 }
 
 impl Membership {
-    /// Discovered peers that currently hold a share (epoch > 0) — the candidate reshare dealers.
+    /// Live peers that currently hold a share (epoch > 0) — the candidate reshare dealers.
+    /// (`peers` is already liveness-filtered by `assemble_participants`.)
     fn live_dealers(&self) -> Vec<SessionPeer> {
         self.peers.iter().filter(|p| p.epoch > 0).cloned().collect()
     }
@@ -248,6 +251,7 @@ async fn assemble_participants(state: &AppState) -> Result<Option<Membership>> {
     let own_id = own_pos as u32 + 1;
 
     let table = state.peer_table.read().await;
+    let now = chrono::Utc::now().timestamp();
     let mut peers = Vec::new();
     let mut all_discovered = true;
     for (i, addr) in node_list.iter().enumerate() {
@@ -256,14 +260,19 @@ async fn assemble_participants(state: &AppState) -> Result<Option<Membership>> {
             continue;
         }
         match table.get(&addr.0) {
-            Some(info) if !info.pubkey.is_empty() => peers.push(SessionPeer {
-                id,
-                grpc_url: info.grpc_url.clone(),
-                pubkey: info.pubkey.clone(),
-                epoch: info.epoch,
-            }),
-            // A nodeList member not yet fully discovered (down / no pubkey). Don't bail —
-            // note the gap so genesis can wait while recovery can proceed on the live subset.
+            // Discovered AND live: pubkey known + direct gossip contact within the window.
+            // A known-but-dead entry (e.g. kept alive only by mesh relay) must NOT be picked
+            // into a session — it would stall every DKG/reshare round at the barrier.
+            Some(info) if !info.pubkey.is_empty() && info.is_live(now) => {
+                peers.push(SessionPeer {
+                    id,
+                    grpc_url: info.grpc_url.clone(),
+                    pubkey: info.pubkey.clone(),
+                    epoch: info.epoch,
+                })
+            }
+            // A nodeList member that is down / not yet discovered. Don't bail — note the gap
+            // so genesis can wait while recovery can proceed on the live subset.
             _ => all_discovered = false,
         }
     }
