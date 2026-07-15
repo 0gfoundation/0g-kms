@@ -138,6 +138,26 @@ pub fn unseal_b64(s: &str, own_privkey: &[u8; 32]) -> Result<Option<SealedShareV
     }
 }
 
+/// Atomically persist the base64 blob to `path` (tmp + rename, so a crash mid-write can't
+/// leave a truncated file). Used when `KMS_SEALED_SHARE_PATH` points at a durable volume —
+/// then a restart reloads automatically, no pipeline capture/inject needed.
+pub fn write_blob_file(path: &str, b64: &str) -> Result<()> {
+    let tmp = format!("{}.tmp", path);
+    std::fs::write(&tmp, b64).map_err(|e| anyhow!("seal write {}: {}", tmp, e))?;
+    std::fs::rename(&tmp, path).map_err(|e| anyhow!("seal rename -> {}: {}", path, e))?;
+    Ok(())
+}
+
+/// Read a persisted blob file. Absent file → `Ok(None)` (fresh start / no durable state).
+pub fn read_blob_file(path: &str) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("seal read {}: {}", path, e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +204,26 @@ mod tests {
             unseal_b64("!!!not base64!!!", &sk).unwrap().is_none(),
             "malformed base64 → None"
         );
+    }
+
+    #[test]
+    fn blob_file_roundtrip_and_absent() {
+        let sk = [7u8; 32];
+        let pk = pubkey_from_private(&sk).unwrap();
+        let path = std::env::temp_dir()
+            .join(format!("kms-seal-file-{}.b64", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        // Absent → None (fresh start).
+        assert!(read_blob_file(&path).unwrap().is_none());
+        // Auto-persist + reload: the SAME base64 string round-trips through the file and
+        // unseals to the exact record.
+        let b64 = seal_b64(&pk, &rec()).unwrap();
+        write_blob_file(&path, &b64).unwrap();
+        let loaded = read_blob_file(&path).unwrap().unwrap();
+        assert_eq!(loaded, b64);
+        assert_eq!(unseal_b64(&loaded, &sk).unwrap().unwrap(), rec());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
