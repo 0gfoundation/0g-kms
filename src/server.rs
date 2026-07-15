@@ -194,38 +194,7 @@ pub async fn handle_app_key(
     //    Signed payload: "\x19Ethereum Signed Message:\n{len}" + "GetSecretResource:{ts}"
     //    hashed with Keccak-256. Compatible with wallet.signMessage / personal_sign.
     let message = format!("GetSecretResource:{}", req.timestamp);
-    let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message);
-    let hash = Keccak256::digest(prefixed.as_bytes());
-
-    let sig_bytes = hex::decode(req.signature.trim_start_matches("0x"))
-        .map_err(|_| KmsError::InvalidSignature("invalid signature hex".into()))?;
-    if sig_bytes.len() != 65 {
-        return Err(KmsError::InvalidSignature(format!(
-            "signature must be 65 bytes (r||s||v), got {}",
-            sig_bytes.len()
-        )));
-    }
-    let sig = Signature::from_slice(&sig_bytes[..64])
-        .map_err(|_| KmsError::InvalidSignature("cannot parse r||s".into()))?;
-    // Accept both normalized (0/1) and Ethereum-style (27/28) v bytes.
-    let rid_byte = match sig_bytes[64] {
-        v @ (0 | 1) => v,
-        v @ (27 | 28) => v - 27,
-        v => {
-            return Err(KmsError::InvalidSignature(format!(
-                "invalid v byte: {}",
-                v
-            )));
-        }
-    };
-    let rid = RecoveryId::try_from(rid_byte)
-        .map_err(|_| KmsError::InvalidSignature("invalid recovery id".into()))?;
-
-    let verifying_key = VerifyingKey::recover_from_prehash(&hash, &sig, rid)
-        .map_err(|_| KmsError::InvalidSignature("cannot recover signer".into()))?;
-    let pubkey = verifying_key.to_encoded_point(false);
-    let addr_hash = Keccak256::digest(&pubkey.as_bytes()[1..]);
-    let recovered_addr = Address::from_slice(&addr_hash[12..]);
+    let recovered_addr = recover_eip191_address(&message, &req.signature)?;
 
     let signer_addresses = get_signer_addresses(
         &state.config.chain.rpc_url,
@@ -265,17 +234,84 @@ pub async fn handle_app_key(
     ))
 }
 
+/// Recover the signer address of an EIP-191 personal_sign signature over `message`.
+/// Accepts both normalized (0/1) and Ethereum-style (27/28) v bytes — compatible with
+/// wallet.signMessage / personal_sign / `cast wallet sign`.
+fn recover_eip191_address(message: &str, signature_hex: &str) -> Result<Address, KmsError> {
+    let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message);
+    let hash = Keccak256::digest(prefixed.as_bytes());
+
+    let sig_bytes = hex::decode(signature_hex.trim_start_matches("0x"))
+        .map_err(|_| KmsError::InvalidSignature("invalid signature hex".into()))?;
+    if sig_bytes.len() != 65 {
+        return Err(KmsError::InvalidSignature(format!(
+            "signature must be 65 bytes (r||s||v), got {}",
+            sig_bytes.len()
+        )));
+    }
+    let sig = Signature::from_slice(&sig_bytes[..64])
+        .map_err(|_| KmsError::InvalidSignature("cannot parse r||s".into()))?;
+    let rid_byte = match sig_bytes[64] {
+        v @ (0 | 1) => v,
+        v @ (27 | 28) => v - 27,
+        v => return Err(KmsError::InvalidSignature(format!("invalid v byte: {}", v))),
+    };
+    let rid = RecoveryId::try_from(rid_byte)
+        .map_err(|_| KmsError::InvalidSignature("invalid recovery id".into()))?;
+    let verifying_key = VerifyingKey::recover_from_prehash(&hash, &sig, rid)
+        .map_err(|_| KmsError::InvalidSignature("cannot recover signer".into()))?;
+    let pubkey = verifying_key.to_encoded_point(false);
+    let addr_hash = Keccak256::digest(&pubkey.as_bytes()[1..]);
+    Ok(Address::from_slice(&addr_hash[12..]))
+}
+
+#[derive(Deserialize)]
+pub struct RefreshRequest {
+    pub timestamp: i64,
+    /// hex-encoded recoverable secp256k1 signature over "Refresh:{timestamp}"
+    /// (EIP-191 personal_sign; e.g. `cast wallet sign "Refresh:<ts>" --private-key <owner>`).
+    pub signature: String,
+}
+
 /// Trigger a proactive refresh of the whole committee's shares (master preserved, old
-/// shares expire). Admin/ops operation.
-/// NOTE: unauthenticated here for the local test harness — production must gate this
-/// (operator auth / on-chain policy) since it forces a cluster-wide reshare.
-pub async fn handle_refresh(State(state): State<AppState>) -> impl IntoResponse {
+/// shares expire). Operator write-op: it forces a cluster-wide reshare, so it is gated to
+/// the **on-chain app owner** — the request must carry an EIP-191 signature over
+/// "Refresh:{timestamp}" that recovers to `getAppInfo(app_id).owner`.
+pub async fn handle_refresh(
+    State(state): State<AppState>,
+    Json(req): Json<RefreshRequest>,
+) -> Result<impl IntoResponse, KmsError> {
+    let now = chrono::Utc::now().timestamp();
+    if (now - req.timestamp).abs() > state.config.server.timestamp_tolerance_secs {
+        return Err(KmsError::InvalidTimestamp(format!(
+            "timestamp {} is too far from now ({})",
+            req.timestamp, now
+        )));
+    }
+
+    let message = format!("Refresh:{}", req.timestamp);
+    let recovered = recover_eip191_address(&message, &req.signature)?;
+
+    let owner = crate::chain::get_app_owner(
+        &state.config.chain.rpc_url,
+        &state.config.chain.contract_address,
+        &state.config.tapp.app_id,
+    )
+    .await?;
+    if recovered != owner {
+        return Err(KmsError::InvalidSignature(format!(
+            "recovered address {:?} is not the on-chain owner {:?} of app {}",
+            recovered, owner, state.config.tapp.app_id
+        )));
+    }
+
+    tracing::info!(operator = ?recovered, "refresh authorized by app owner");
     match crate::init::trigger_refresh(&state).await {
-        Ok(()) => (StatusCode::OK, "refresh complete".to_string()),
-        Err(e) => (
+        Ok(()) => Ok((StatusCode::OK, "refresh complete".to_string())),
+        Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("refresh failed: {}", e),
-        ),
+        )),
     }
 }
 
