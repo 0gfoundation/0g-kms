@@ -19,16 +19,33 @@ use crate::{
 
 // ─── Peer table ───────────────────────────────────────────────────────────────
 
+/// A peer counts as LIVE only on direct evidence within this window: it pushed gossip to us,
+/// or we successfully pushed to it. Relayed gossip NEVER refreshes liveness (otherwise a mesh
+/// keeps re-advertising a dead node's entry and it looks perpetually alive). Gossip runs every
+/// 30s, so 90s = three missed rounds.
+pub const PEER_LIVENESS_WINDOW_SECS: i64 = 90;
+
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
     pub grpc_url: String,
+    /// Unix seconds of the last DIRECT contact with this peer (it pushed gossip to us, or our
+    /// push to it succeeded). 0 = known only via relay, never directly seen. Relayed entries
+    /// must not touch this — "known" and "alive" are different things.
     pub last_seen: i64,
     /// Uncompressed secp256k1 pubkey (65 bytes), learned via gossip. Empty until known;
     /// needed to ECIES-encrypt DKG round-1 p2p shares to this peer.
     pub pubkey: Vec<u8>,
     /// Peer's current polynomial epoch, learned via gossip (0 = no share yet). Used to agree
     /// on the cluster epoch so a reshare picks a monotonically increasing next epoch.
+    /// (Kept even when the peer is not live — epoch knowledge is monotonic.)
     pub epoch: u64,
+}
+
+impl PeerInfo {
+    /// Direct evidence of life within the liveness window.
+    pub fn is_live(&self, now: i64) -> bool {
+        now - self.last_seen <= PEER_LIVENESS_WINDOW_SECS
+    }
 }
 
 // ─── Shared state ─────────────────────────────────────────────────────────────

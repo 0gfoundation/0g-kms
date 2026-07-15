@@ -571,6 +571,15 @@ async fn gossip_round(state: &AppState) {
                 let now = chrono::Utc::now().timestamp();
                 let mut table = state.peer_table.write().await;
 
+                // Our push to `target` succeeded — DIRECT evidence that the target itself is
+                // alive. This (and a peer pushing to us) are the only two things that refresh
+                // liveness.
+                for e in table.values_mut() {
+                    if &e.grpc_url == target {
+                        e.last_seen = now;
+                    }
+                }
+
                 for peer in received {
                     if &peer.grpc_url == self_url || peer.grpc_url.is_empty() {
                         continue;
@@ -583,8 +592,11 @@ async fn gossip_round(state: &AppState) {
                                 .entry(key)
                                 .and_modify(|e| {
                                     e.grpc_url = peer.grpc_url.clone();
-                                    e.last_seen = now;
-                                    // Don't clobber a known pubkey with an empty one.
+                                    // RELAYED knowledge: update what we know about the peer
+                                    // (url/pubkey/epoch) but NEVER its liveness — otherwise a
+                                    // mesh keeps re-advertising a dead node and it never
+                                    // expires (a dead peer would keep being picked as a
+                                    // reshare dealer and stall every session).
                                     if !peer.pubkey.is_empty() {
                                         e.pubkey = peer.pubkey.clone();
                                     }
@@ -596,7 +608,9 @@ async fn gossip_round(state: &AppState) {
                                     tracing::info!(peer_url = %peer.grpc_url, "gossip: discovered new peer");
                                     PeerInfo {
                                         grpc_url: peer.grpc_url.clone(),
-                                        last_seen: now,
+                                        // Known via relay only — not yet seen alive by US.
+                                        // We'll push to it next round; success bumps this.
+                                        last_seen: 0,
                                         pubkey: peer.pubkey.clone(),
                                         epoch: peer.epoch,
                                     }
@@ -606,9 +620,11 @@ async fn gossip_round(state: &AppState) {
                     }
                 }
 
-                // Prune peers not seen for > 5 minutes
-                let cutoff = now - 300;
-                table.retain(|_, v| v.last_seen > cutoff);
+                // No prune: membership is anchored on the on-chain nodeList (bounded), and
+                // entries carry value even when stale (URL/pubkey/epoch for discovery and
+                // monotonic-epoch tracking). Liveness is judged per-use via `is_live`, not by
+                // evicting entries — eviction was self-defeating anyway, since relayed gossip
+                // kept resurrecting dead entries.
             }
             Err(e) => tracing::warn!(target = %target, error = %e, "gossip push failed"),
         }
