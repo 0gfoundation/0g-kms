@@ -342,8 +342,13 @@ pub async fn handle_peers(State(state): State<AppState>) -> impl IntoResponse {
         .collect();
     let live_share_holders = (own_has_share as usize)
         + table.values().filter(|p| p.is_live(now) && p.epoch > 0).count();
+    // Cluster-wide current epoch = max over self + all known peers (epoch is monotonic, so
+    // even a stale entry's epoch is a valid lower bound). Compare a captured sealed blob's
+    // epoch against this before reusing it.
+    let cluster_epoch = own_epoch.max(table.values().map(|p| p.epoch).max().unwrap_or(0));
 
     Json(serde_json::json!({
+        "cluster_epoch": cluster_epoch,
         "self": {
             "eth_addr": format!("0x{}", hex::encode(state.signing_key.eth_address)),
             "grpc_url": state.config.cluster.self_url,
