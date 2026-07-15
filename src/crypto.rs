@@ -35,8 +35,10 @@ pub type Bls = Bls12381G2Impl;
 
 /// Domain separation tag for the derivation message (preimage of hash-to-curve).
 const DPRF_DST: &[u8] = b"0g-kms:dprf:v1";
-/// Domain separation tag for hashing σ down to a 32-byte app key.
-const KDF_DST: &[u8] = b"0g-kms:dprf-kdf:v1";
+/// Domain separation tag (HKDF `info`) for deriving the 32-byte app key from σ.
+/// v2 = HKDF-SHA256 (v1 was bare SHA-256; bumped with the construction so the label always
+/// identifies one exact derivation).
+const KDF_DST: &[u8] = b"0g-kms:dprf-kdf:v2";
 
 /// Bind `app_id` (namespace) and caller-supplied `material` into a single, canonical
 /// derivation message. Length-prefixed so no two distinct (app_id, material) pairs can
@@ -108,9 +110,11 @@ pub fn sigma_to_app_key(sigma: &Signature<Bls>) -> [u8; 32] {
     okm
 }
 
-/// Combine ≥ threshold partials into the 32-byte app key WITHOUT verification. Convenience for
-/// crypto tests where all partials are honest by construction. Production derivation goes
-/// through `dprf_sigma` + `dprf_verify` + `sigma_to_app_key` (see `grpc::collect_and_dprf`).
+/// Combine ≥ threshold partials into the 32-byte app key WITHOUT verification. Test-only
+/// convenience (all partials honest by construction) — gated so production code cannot
+/// accidentally bypass `dprf_verify`; real derivation goes through
+/// `dprf_sigma` + `dprf_verify` + `sigma_to_app_key` (see `grpc::collect_and_dprf`).
+#[cfg(test)]
 pub fn dprf_combine(partials: &[SignatureShare<Bls>]) -> Result<[u8; 32]> {
     Ok(sigma_to_app_key(&dprf_sigma(partials)?))
 }
