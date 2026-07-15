@@ -339,9 +339,18 @@ async fn store_share(state: &AppState, shard: ShardState, group_pubkey: Vec<u8>)
             );
             match crate::seal::seal_b64(&pk, &rec) {
                 Ok(b64) => {
-                    // Two capture channels for the deploy pipeline: the log line and
-                    // GET /sealed-share (both carry the same TEE-encrypted blob).
+                    // Capture channels for restart persistence: the log line and
+                    // GET /sealed-share (pipeline capture → env re-inject), plus — when
+                    // KMS_SEALED_SHARE_PATH points at a durable volume — an auto-persisted
+                    // file that a restart reloads with zero pipeline involvement.
                     *state.sealed_share.write().await = Some(b64.clone());
+                    if let Ok(path) = std::env::var("KMS_SEALED_SHARE_PATH") {
+                        if !path.trim().is_empty() {
+                            if let Err(e) = crate::seal::write_blob_file(path.trim(), &b64) {
+                                tracing::warn!(error = %e, "failed to persist sealed share to file");
+                            }
+                        }
+                    }
                     info!(epoch = shard.epoch, "SEALED_SHARE={}", b64);
                 }
                 Err(e) => tracing::warn!(error = %e, "failed to seal share for persistence"),
@@ -359,9 +368,32 @@ async fn store_share(state: &AppState, shard: ShardState, group_pubkey: Vec<u8>)
 /// normal genesis/rejoin. A master change is the operator's call: they omit the env to force a
 /// fresh start (clear it on any re-genesis).
 async fn try_reload_sealed(state: &AppState) -> bool {
+    // Blob sources, in priority order:
+    //   1. KMS_SEALED_SHARE — explicit operator-injected blob (pipeline capture → env).
+    //   2. KMS_SEALED_SHARE_PATH — file auto-persisted by a previous run on a durable volume.
+    // Neither present → deliberate fresh start (on a re-genesis the operator must omit the
+    // env AND clear the file).
     let b64 = match std::env::var("KMS_SEALED_SHARE") {
         Ok(v) if !v.trim().is_empty() => v,
-        _ => return false, // no blob → operator wants a fresh start
+        _ => {
+            let from_file = std::env::var("KMS_SEALED_SHARE_PATH")
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .and_then(|p| match crate::seal::read_blob_file(p.trim()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sealed share file unreadable — will rejoin");
+                        None
+                    }
+                });
+            match from_file {
+                Some(v) => {
+                    info!("loading sealed share from KMS_SEALED_SHARE_PATH file");
+                    v
+                }
+                None => return false, // no blob anywhere → operator wants a fresh start
+            }
+        }
     };
     let rec = match crate::seal::unseal_b64(&b64, &state.signing_key.private_key) {
         Ok(Some(r)) => r,
