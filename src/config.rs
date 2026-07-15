@@ -77,6 +77,17 @@ pub struct ClusterConfig {
     /// Field was previously named "peers" — both names are accepted.
     #[serde(default, alias = "peers")]
     pub seeds: Vec<String>,
+    /// Optional sealed-share blob (base64url, as emitted in `SEALED_SHARE=` logs or by
+    /// GET /sealed-share) to reload at boot instead of rejoining. Per-node value — paste it
+    /// into this node's deploy config on restart. Omit for a deliberate fresh start (e.g.
+    /// after a re-genesis). The KMS_SEALED_SHARE env var overrides this if set.
+    #[serde(default)]
+    pub sealed_share: Option<String>,
+    /// Optional path to auto-persist the sealed share on every share change (atomic write).
+    /// Only useful if the path lives on a volume that survives restarts; at boot the file is
+    /// read when no blob is provided. The KMS_SEALED_SHARE_PATH env var overrides this.
+    #[serde(default)]
+    pub sealed_share_path: Option<String>,
 }
 
 impl Config {
