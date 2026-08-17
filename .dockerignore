@@ -1,0 +1,22 @@
+# Keep the build context small. The Dockerfile does `COPY . .`, so anything listed here would
+# otherwise be shipped to the daemon and baked into the builder layer on every build.
+#
+# `target/` alone reaches double-digit gigabytes once you have built locally, and it is useless
+# inside the image: the builder compiles from scratch anyway (different toolchain image, and the
+# host artifacts would not be reused). Leaving it out of the context is the difference between a
+# multi-gigabyte builder layer per build and a few megabytes.
+target/
+
+.git/
+.github/
+
+# Local state and scratch
+*.sealed
+kms-deploy.toml
+docker-compose-test.yml
+
+# Nothing under here affects the binary
+docs/
+test/
+examples/
+*.md

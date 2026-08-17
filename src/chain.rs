@@ -131,6 +131,7 @@ pub async fn get_signer_addresses(
 
     match fetch_node_list(rpc_url, contract_address, app_id).await {
         Ok(addrs) => {
+            crate::metrics::inc(&crate::metrics::m().chain_rpc_ok);
             node_list_cache().write().await.insert(
                 key,
                 NodeListEntry {
@@ -141,9 +142,11 @@ pub async fn get_signer_addresses(
             Ok(addrs)
         }
         Err(e) => {
+            crate::metrics::inc(&crate::metrics::m().chain_rpc_fail);
             // Stale fallback: serve the last known list rather than failing every request
             // while the RPC is rate-limited or flapping.
             if let Some(old) = node_list_cache().read().await.get(&key) {
+                crate::metrics::inc(&crate::metrics::m().chain_stale_served);
                 tracing::warn!(error = %e, app_id, "nodeList refresh failed — serving stale cache");
                 return Ok(old.addrs.clone());
             }

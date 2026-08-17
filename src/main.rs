@@ -6,6 +6,7 @@ mod dkg;
 mod error;
 mod grpc;
 mod init;
+mod metrics;
 mod seal;
 mod server;
 mod tee;
@@ -15,12 +16,24 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
+    // `KMS_LOG_FORMAT=json` emits one JSON object per event, so a log collector can index the
+    // structured fields the service record carries (app_id, servers, epoch, duration_ms) instead
+    // of reducing them to a string. Left unset the output stays human-readable, which is what
+    // the runbooks and the local test harness grep against. Colour follows the terminal, so
+    // captured output is never littered with escape codes either way.
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "kms=info".into()),
         )
-        .init();
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()));
+    match std::env::var("KMS_LOG_FORMAT").as_deref() {
+        Ok("json") => builder.json().flatten_event(true).init(),
+        _ => builder.init(),
+    }
+
+    // Initialize here so kms_uptime_seconds is measured from boot, not from the first scrape.
+    metrics::m();
 
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "kms.toml".to_string());
 

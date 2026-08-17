@@ -39,6 +39,11 @@ pub struct PeerInfo {
     /// on the cluster epoch so a reshare picks a monotonically increasing next epoch.
     /// (Kept even when the peer is not live — epoch knowledge is monotonic.)
     pub epoch: u64,
+    /// Peer's view of the group public key, learned via gossip. Empty = not reported (no share
+    /// yet, or a node predating the gossip field). MONITORING ONLY: it is never an input to a
+    /// decision, only compared against ours, so that a single node can detect a forked master
+    /// instead of an operator diffing logs across every host.
+    pub group_pubkey: Vec<u8>,
 }
 
 impl PeerInfo {
@@ -180,6 +185,26 @@ pub async fn handle_app_key(
     State(state): State<AppState>,
     Json(req): Json<AppKeyRequest>,
 ) -> Result<impl IntoResponse, KmsError> {
+    let r = app_key_inner(&state, req).await;
+    // Classify for `kms_appkey_requests_total`. Authorization failures are the caller's
+    // problem, "not ready" is this node's, and everything else needs a human — keeping them
+    // apart is what makes the counter alertable at all.
+    let mt = crate::metrics::m();
+    crate::metrics::inc(match &r {
+        Ok(_) => &mt.appkey_ok,
+        Err(KmsError::InvalidTimestamp(_))
+        | Err(KmsError::InvalidSignature(_))
+        | Err(KmsError::AppNotFound(_)) => &mt.appkey_unauthorized,
+        Err(KmsError::ConfigError(_)) => &mt.appkey_not_ready,
+        Err(_) => &mt.appkey_error,
+    });
+    r
+}
+
+async fn app_key_inner(
+    state: &AppState,
+    req: AppKeyRequest,
+) -> Result<impl IntoResponse, KmsError> {
     // 1. Validate timestamp
     let now = chrono::Utc::now().timestamp();
     if (now - req.timestamp).abs() > state.config.server.timestamp_tolerance_secs {
@@ -217,14 +242,35 @@ pub async fn handle_app_key(
     //    the app key, bound to (app_id, material). The master is never reconstructed.
     let material = hex::decode(req.material.trim_start_matches("0x"))
         .map_err(|_| KmsError::CryptoError("invalid material hex".into()))?;
-    let app_key = collect_and_dprf(&state, &req.app_id, &material).await?;
+    let started = std::time::Instant::now();
+    let (app_key, trace) = collect_and_dprf(state, &req.app_id, &material).await?;
 
     // 4. ECIES encrypt for caller
     let pubkey_bytes = hex::decode(req.pubkey.trim_start_matches("0x"))
         .map_err(|_| KmsError::CryptoError("invalid pubkey hex".into()))?;
     let ciphertext = ecies_encrypt(&pubkey_bytes, &app_key)?;
 
-    tracing::info!(app_id = %req.app_id, signer = ?recovered_addr, "app-key issued");
+    // Per-request service record. This is the only place the "which nodes served it" answer
+    // exists — the coordinator collected the partials, and nothing else on the cluster sees the
+    // set. It belongs in the log rather than in a metric: one series per request would blow up
+    // cardinality, and the caller identity below is deliberately kept out of /metrics labels,
+    // where it would be world-readable.
+    tracing::info!(
+        app_id = %req.app_id,
+        signer = ?recovered_addr,
+        epoch = trace.epoch,
+        // Comma-separated rather than Debug-formatted: `1,3` survives a log pipeline as a
+        // plain string a query can match on, where `[1, 3]` would not.
+        servers = %trace
+            .servers
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        server_count = trace.servers.len(),
+        duration_ms = started.elapsed().as_millis() as u64,
+        "app-key issued"
+    );
 
     Ok((
         StatusCode::OK,
@@ -306,7 +352,10 @@ pub async fn handle_refresh(
     }
 
     tracing::info!(operator = ?recovered, "refresh authorized by app owner");
-    match crate::init::trigger_refresh(&state).await {
+    let outcome = crate::init::trigger_refresh(&state).await;
+    let mt = crate::metrics::m();
+    crate::metrics::record(&mt.refresh_ok, &mt.refresh_fail, &outcome);
+    match outcome {
         Ok(()) => Ok((StatusCode::OK, "refresh complete".to_string())),
         Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -323,10 +372,11 @@ pub async fn handle_refresh(
 /// how far the cluster is from the threshold floor.
 pub async fn handle_peers(State(state): State<AppState>) -> impl IntoResponse {
     let now = chrono::Utc::now().timestamp();
-    let (own_epoch, own_has_share) = {
-        let s = state.shard.read().await;
-        (s.as_ref().map(|x| x.epoch).unwrap_or(0), s.is_some())
-    };
+    // Same snapshot /metrics renders from, so a dashboard and a curl can never disagree about
+    // the numbers an operator is deciding on.
+    let v = crate::metrics::cluster_view(&state).await;
+    let own_gpk = v.group_pubkey.as_ref().map(hex::encode);
+
     let table = state.peer_table.read().await;
     let peers: Vec<serde_json::Value> = table
         .iter()
@@ -337,29 +387,77 @@ pub async fn handle_peers(State(state): State<AppState>) -> impl IntoResponse {
                 "epoch": p.epoch,
                 "live": p.is_live(now),
                 "last_seen": p.last_seen,
+                // Empty = the peer has not reported one (no share yet, or it predates the
+                // gossip field). That reads as unknown, not as a disagreement.
+                "group_pubkey": if p.group_pubkey.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    hex::encode(&p.group_pubkey).into()
+                },
             })
         })
         .collect();
-    let live_share_holders = (own_has_share as usize)
-        + table.values().filter(|p| p.is_live(now) && p.epoch > 0).count();
-    // Cluster-wide current epoch = max over self + all known peers (epoch is monotonic, so
-    // even a stale entry's epoch is a valid lower bound). Compare a captured sealed blob's
-    // epoch against this before reusing it.
-    let cluster_epoch = own_epoch.max(table.values().map(|p| p.epoch).max().unwrap_or(0));
 
     Json(serde_json::json!({
-        "cluster_epoch": cluster_epoch,
+        // Cluster-wide current epoch = max over self + all known peers (epoch is monotonic, so
+        // even a stale entry's epoch is a valid lower bound). Compare a captured sealed blob's
+        // epoch against this before reusing it.
+        "cluster_epoch": v.cluster_epoch,
         "self": {
             "eth_addr": format!("0x{}", hex::encode(state.signing_key.eth_address)),
             "grpc_url": state.config.cluster.self_url,
-            "epoch": own_epoch,
-            "has_share": own_has_share,
+            "epoch": v.own_epoch,
+            "has_share": v.has_share,
+            // 1-based nodeList position, which is also the shard index. Confirming these run
+            // 1..n across the cluster is how a reordered nodeList gets caught before it forks
+            // the master.
+            "own_id": v.own_id,
+            "group_pubkey": own_gpk,
         },
         "peers": peers,
-        "threshold": state.config.cluster.threshold,
-        "total_nodes": state.config.cluster.total_nodes,
-        "live_share_holders": live_share_holders,
+        "threshold": v.threshold,
+        "total_nodes": v.total_nodes,
+        // The line that matters operationally: below this a shardless node can no longer
+        // rejoin, while derives carry on looking perfectly healthy.
+        "recovery_threshold": v.recovery_threshold,
+        "leading_holders": v.leading_holders,
+        "live_share_holders": v.live_share_holders,
+        // Live peers reporting a different master. Anything but 0 is a fork.
+        "group_pubkey_mismatch": v.group_pubkey_mismatch,
     }))
+}
+
+// ─── Monitoring endpoints ─────────────────────────────────────────────────────
+
+/// GET /health — liveness only: the process is up and serving. Deliberately says nothing about
+/// cluster state, so a supervisor never restarts a node that is merely waiting to rejoin.
+pub async fn handle_health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+/// GET /ready — readiness: 200 only when this node can actually contribute to a derive, i.e. it
+/// holds a share and knows the group public key (needed to verify the combined signature).
+/// 503 otherwise, so a load balancer stops sending derives to a node that would only fail them.
+pub async fn handle_ready(State(state): State<AppState>) -> impl IntoResponse {
+    let has_share = state.shard.read().await.is_some();
+    let has_gpk = state.group_pubkey.read().await.is_some();
+    if has_share && has_gpk {
+        (StatusCode::OK, "ready")
+    } else if has_share {
+        (StatusCode::SERVICE_UNAVAILABLE, "no group public key")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "no share")
+    }
+}
+
+/// GET /metrics — Prometheus text exposition for this node. Same exposure as /peers: no key
+/// material, and nothing labelled by app or caller.
+pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        crate::metrics::render(&state).await,
+    )
 }
 
 /// GET /sealed-share — the latest sealed share blob (base64url), for the deploy pipeline to
@@ -378,5 +476,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/refresh", axum::routing::post(handle_refresh))
         .route("/peers", axum::routing::get(handle_peers))
         .route("/sealed-share", axum::routing::get(handle_sealed_share))
+        .route("/health", axum::routing::get(handle_health))
+        .route("/ready", axum::routing::get(handle_ready))
+        .route("/metrics", axum::routing::get(handle_metrics))
         .with_state(state)
 }

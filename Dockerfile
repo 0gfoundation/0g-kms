@@ -5,6 +5,8 @@ COPY . .
 RUN cargo build --release --bin kms-server
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# curl is here for the compose healthcheck (the image ships no HTTP client otherwise), and it
+# doubles as the tool every step of the ops runbook uses when shelling into a node.
+RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/kms-server /usr/local/bin/kms-server
 CMD ["kms-server", "/config/kms.toml"]

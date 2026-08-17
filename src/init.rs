@@ -360,7 +360,10 @@ fn sealed_share_blob(state: &AppState) -> Option<String> {
         .filter(|v| !v.trim().is_empty())
 }
 
-fn sealed_share_path(state: &AppState) -> Option<String> {
+/// The durable path the sealed share is auto-persisted to, if configured. Also read by the
+/// gossip loop's writability probe — a path that silently stopped accepting writes is invisible
+/// until the next share change tries to persist and fails.
+pub fn sealed_share_path(state: &AppState) -> Option<String> {
     std::env::var("KMS_SEALED_SHARE_PATH")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -390,16 +393,28 @@ async fn store_share(state: &AppState, shard: ShardState, group_pubkey: Vec<u8>)
                     *state.sealed_share.write().await = Some(b64.clone());
                     if let Some(path) = sealed_share_path(state) {
                         if let Err(e) = crate::seal::write_blob_file(&path, &b64) {
+                            crate::metrics::inc(&crate::metrics::m().sealed_persist_fail);
                             tracing::warn!(error = %e, "failed to persist sealed share to file");
                         }
                     }
                     info!(epoch = shard.epoch, "SEALED_SHARE={}", b64);
                 }
-                Err(e) => tracing::warn!(error = %e, "failed to seal share for persistence"),
+                Err(e) => {
+                    crate::metrics::inc(&crate::metrics::m().sealed_persist_fail);
+                    tracing::warn!(error = %e, "failed to seal share for persistence");
+                }
             }
         }
-        Err(e) => tracing::warn!(error = %e, "failed to derive own pubkey for sealing"),
+        Err(e) => {
+            crate::metrics::inc(&crate::metrics::m().sealed_persist_fail);
+            tracing::warn!(error = %e, "failed to derive own pubkey for sealing");
+        }
     }
+    // Anchor the master against the baseline recorded on first formation, and freeze how long
+    // this node took to come back. Both go through here because this is the single point every
+    // share adoption except the sealed fast path passes through.
+    crate::metrics::check_master_baseline(sealed_share_path(state).as_deref(), &group_pubkey);
+    crate::metrics::note_share_acquired();
     *state.group_pubkey.write().await = Some(group_pubkey);
     *state.shard.write().await = Some(shard);
 }
@@ -424,6 +439,7 @@ async fn try_reload_sealed(state: &AppState) -> bool {
                 match crate::seal::read_blob_file(&p) {
                     Ok(v) => v,
                     Err(e) => {
+                        crate::metrics::inc(&crate::metrics::m().sealed_persist_fail);
                         tracing::warn!(error = %e, "sealed share file unreadable — will rejoin");
                         None
                     }
@@ -441,10 +457,12 @@ async fn try_reload_sealed(state: &AppState) -> bool {
     let rec = match crate::seal::unseal_b64(&b64, &state.signing_key.private_key) {
         Ok(Some(r)) => r,
         Ok(None) => {
+            crate::metrics::inc(&crate::metrics::m().sealed_identity_mismatch);
             info!("KMS_SEALED_SHARE not usable by this TEE identity — will rejoin");
             return false;
         }
         Err(e) => {
+            crate::metrics::inc(&crate::metrics::m().sealed_identity_mismatch);
             tracing::warn!(error = %e, "sealed share corrupt — will rejoin");
             return false;
         }
@@ -461,6 +479,7 @@ async fn try_reload_sealed(state: &AppState) -> bool {
     }
     let cluster_epoch = state.known_epoch().await;
     if rec.epoch < cluster_epoch {
+        crate::metrics::inc(&crate::metrics::m().sealed_stale_discarded);
         info!(
             share_epoch = rec.epoch,
             cluster_epoch, "sealed share is stale — discarding and rejoining"
@@ -475,6 +494,8 @@ async fn try_reload_sealed(state: &AppState) -> bool {
     );
     // The adopted blob is also the current sealed share — expose it on /sealed-share.
     *state.sealed_share.write().await = Some(b64.trim().to_string());
+    crate::metrics::check_master_baseline(sealed_share_path(state).as_deref(), &rec.master_id);
+    crate::metrics::note_share_acquired();
     *state.group_pubkey.write().await = Some(rec.master_id);
     *state.shard.write().await = Some(ShardState {
         shard_index: rec.shard_index,
@@ -839,6 +860,7 @@ pub async fn form_cluster(state: AppState) {
                 continue;
             }
             Err(e) => {
+                crate::metrics::inc(&crate::metrics::m().membership_fail);
                 tracing::warn!(error = %e, "membership assembly failed; retrying");
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -858,7 +880,10 @@ pub async fn form_cluster(state: AppState) {
                     continue;
                 }
                 info!(own_id = m.own_id, total = m.total, threshold = m.threshold, "fresh cluster — running genesis DKG");
-                run_genesis(&state, m.own_id, m.peers, m.threshold, m.total).await
+                let r = run_genesis(&state, m.own_id, m.peers, m.threshold, m.total).await;
+                let mt = crate::metrics::m();
+                crate::metrics::record(&mt.genesis_ok, &mt.genesis_fail, &r);
+                r
             }
             Ok(JoinResult::SeedReachableDeclined) => {
                 // Established cluster, no local share → recover via reshare. Prefer FULL
@@ -881,7 +906,10 @@ pub async fn form_cluster(state: AppState) {
                     subset_wait_since = None;
                 }
                 info!(own_id = m.own_id, "cluster established — recovering our share via reshare");
-                run_reshare_recovery(&state, m).await
+                let r = run_reshare_recovery(&state, m).await;
+                let mt = crate::metrics::m();
+                crate::metrics::record(&mt.recovery_ok, &mt.recovery_fail, &r);
+                r
             }
             Err(e) => Err(anyhow!("cluster probe failed: {}", e)),
         };
@@ -928,6 +956,7 @@ async fn fall_behind_watchdog(state: AppState) {
         }
         behind_checks = 0;
 
+        crate::metrics::inc(&crate::metrics::m().fall_behind);
         tracing::warn!(
             own_epoch,
             cluster_epoch,
@@ -935,12 +964,18 @@ async fn fall_behind_watchdog(state: AppState) {
         );
         match assemble_participants(&state).await {
             Ok(Some(m)) => {
-                if let Err(e) = run_reshare_recovery(&state, m).await {
+                let r = run_reshare_recovery(&state, m).await;
+                let mt = crate::metrics::m();
+                crate::metrics::record(&mt.recovery_ok, &mt.recovery_fail, &r);
+                if let Err(e) = r {
                     tracing::warn!(error = %e, "catch-up rejoin failed; will retry");
                 }
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "catch-up membership assembly failed"),
+            Err(e) => {
+                crate::metrics::inc(&crate::metrics::m().membership_fail);
+                tracing::warn!(error = %e, "catch-up membership assembly failed");
+            }
         }
     }
 }

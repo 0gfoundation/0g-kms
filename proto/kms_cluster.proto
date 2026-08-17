@@ -89,6 +89,11 @@ message NodeInfo {
   bytes  pubkey   = 3;  // uncompressed secp256k1 pubkey (65 bytes) for DKG p2p ECIES; may be empty
   uint64 epoch    = 4;  // sender's current polynomial epoch (0 = no share yet); lets every
                         // node agree on the cluster epoch and reshares pick a monotonic next one
+  bytes  group_pubkey = 5;  // sender's view of the cluster's group public key (empty = none yet).
+                        // MONITORING ONLY — never used to make a decision, only compared, so a
+                        // node can tell on its own that the cluster has forked into two masters
+                        // instead of an operator diffing logs across every host. Empty from a
+                        // node that predates this field, which reads as "unknown", not "differs".
 }
 
 message GossipRequest {
