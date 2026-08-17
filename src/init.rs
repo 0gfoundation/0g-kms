@@ -7,10 +7,11 @@ use group::GroupEncoding;
 use tracing::info;
 
 use crate::{
+    auth::verify_cluster_response,
     chain::get_signer_addresses,
     crypto::{
-        blsful_share_scalar, ecies_decrypt, gennaro_share_to_blsful, share_from_bytes,
-        share_to_bytes, sign_request, split_master, DkgGroup, DkgScalar,
+        blsful_share_scalar, ecies_decrypt, gennaro_share_to_blsful, shard_signing_msg,
+        share_from_bytes, share_to_bytes, sign_request, split_master, DkgGroup, DkgScalar,
     },
     dkg::{run_session, SessionPeer},
     server::{AppState, ShardState},
@@ -182,6 +183,19 @@ async fn request_shard_from_peer(
             }
         })?
         .into_inner();
+
+    // Verify the responder signed this shard for us before trusting it: a substituted
+    // ciphertext would otherwise be decrypted and stored as our share. Signer must be an
+    // on-chain node and the signature must bind this exact ciphertext/index to our address.
+    let signing_msg = shard_signing_msg(
+        "RequestShard",
+        &state.signing_key.eth_address,
+        resp.shard_index,
+        &resp.ciphertext,
+    );
+    verify_cluster_response(&signing_msg, &resp.signature, &state.config)
+        .await
+        .map_err(|e| SeedError::Declined(anyhow!("shard response verification failed: {}", e)))?;
 
     let shard_bytes = ecies_decrypt(&state.signing_key.private_key, &resp.ciphertext)
         .map_err(|e| SeedError::Declined(anyhow!("ECIES decrypt failed: {}", e)))?;

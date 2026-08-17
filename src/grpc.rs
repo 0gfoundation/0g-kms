@@ -4,11 +4,11 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::{
-    auth::authenticate,
+    auth::{authenticate, verify_cluster_response},
     crypto::{
-        dprf_message, dprf_partial, dprf_sigma, dprf_verify, ecies_decrypt, ecies_encrypt,
-        sigma_to_app_key,
-        partial_from_bytes, partial_to_bytes, share_from_bytes, sign_request,
+        dprf_message, dprf_partial, dprf_partial_signing_msg, dprf_sigma, dprf_verify,
+        ecies_decrypt, ecies_encrypt, shard_signing_msg, sigma_to_app_key,
+        partial_from_bytes, partial_to_bytes, share_from_bytes, sign_bytes, sign_request,
     },
     error::KmsError,
     server::{AppState, PeerInfo},
@@ -70,10 +70,20 @@ impl KmsCluster for KmsClusterService {
                 Status::internal("encryption failed")
             })?;
 
+        // Sign the ciphertext (bound to caller + metadata) so the coordinator can verify the
+        // partial came from us unmodified — ECIES alone would let an attacker substitute it.
+        let caller_addr: [u8; 20] = ctx.caller_eth_addr.into();
+        let msg = dprf_partial_signing_msg(&caller_addr, shard.shard_index, shard.epoch, &ciphertext);
+        let signature = sign_bytes(&self.state.signing_key.private_key, &msg).map_err(|e| {
+            tracing::error!(error = %e, "partial response signing failed");
+            Status::internal("response signing failed")
+        })?;
+
         Ok(Response::new(EncryptedPartial {
             ciphertext,
             shard_index: shard.shard_index,
             epoch: shard.epoch,
+            signature,
         }))
     }
 
@@ -98,9 +108,17 @@ impl KmsCluster for KmsClusterService {
                 Status::internal("encryption failed")
             })?;
 
+        let caller_addr: [u8; 20] = ctx.caller_eth_addr.into();
+        let msg = shard_signing_msg("GetShardContribution", &caller_addr, shard.shard_index, &ciphertext);
+        let signature = sign_bytes(&self.state.signing_key.private_key, &msg).map_err(|e| {
+            tracing::error!(error = %e, "shard response signing failed");
+            Status::internal("response signing failed")
+        })?;
+
         Ok(Response::new(EncryptedShard {
             ciphertext,
             shard_index: shard.shard_index,
+            signature,
         }))
     }
 
@@ -293,9 +311,17 @@ impl KmsClusterService {
             Status::internal("encryption failed")
         })?;
 
+        let addr_bytes: [u8; 20] = caller_addr.into();
+        let msg = shard_signing_msg("RequestShard", &addr_bytes, *shard_index, &ciphertext);
+        let signature = sign_bytes(&self.state.signing_key.private_key, &msg).map_err(|e| {
+            tracing::error!(error = %e, "init-shard response signing failed");
+            Status::internal("response signing failed")
+        })?;
+
         Ok(Some(EncryptedShard {
             ciphertext,
             shard_index: *shard_index,
+            signature,
         }))
     }
 
@@ -328,6 +354,8 @@ pub async fn get_dprf_partial(
     sig: &[u8],
     timestamp: i64,
     own_private_key: &[u8; 32],
+    own_eth_addr: &[u8; 20],
+    config: &crate::config::Config,
 ) -> anyhow::Result<(u32, Vec<u8>, u64)> {
     use tonic::metadata::MetadataValue;
     use tonic::transport::Channel;
@@ -357,6 +385,14 @@ pub async fn get_dprf_partial(
     );
 
     let resp = client.get_dprf_partial(request).await?.into_inner();
+
+    // Verify origin + integrity BEFORE decrypting: the signer must be a registered node and
+    // the signature must cover this exact ciphertext/metadata bound to us. Without this an
+    // active attacker could substitute a ciphertext we would decrypt into an attacker value.
+    let signing_msg = dprf_partial_signing_msg(own_eth_addr, resp.shard_index, resp.epoch, &resp.ciphertext);
+    verify_cluster_response(&signing_msg, &resp.signature, config)
+        .await
+        .map_err(|e| anyhow::anyhow!("partial response verification failed: {}", e))?;
 
     let partial_bytes = ecies_decrypt(own_private_key, &resp.ciphertext)
         .map_err(|e| anyhow::anyhow!("ECIES decrypt failed: {}", e))?;
@@ -496,7 +532,16 @@ pub async fn collect_and_dprf(
     let mut peer_futures: FuturesUnordered<_> = peer_urls
         .iter()
         .map(|url| {
-            get_dprf_partial(url, app_id, material, &sig, timestamp, &state.signing_key.private_key)
+            get_dprf_partial(
+                url,
+                app_id,
+                material,
+                &sig,
+                timestamp,
+                &state.signing_key.private_key,
+                &state.signing_key.eth_address,
+                &state.config,
+            )
         })
         .collect();
 

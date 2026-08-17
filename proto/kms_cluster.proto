@@ -64,6 +64,11 @@ message EncryptedPartial {
   uint32 shard_index = 2;  // source node's shard index (for dedup at the coordinator)
   uint64 epoch       = 3;  // polynomial epoch of the share that produced this partial;
                            // the coordinator only combines partials of a single epoch
+  bytes  signature   = 4;  // responder's recoverable secp256k1 signature (65 bytes) over
+                           // bind("GetDprfPartial", caller_addr, shard_index, epoch, ciphertext).
+                           // ECIES gives confidentiality only; this proves origin + integrity so
+                           // an active attacker cannot substitute a ciphertext the caller would
+                           // decrypt into an attacker-chosen value. Signer must be an on-chain node.
 }
 
 // ─── Shard messages ───────────────────────────────────────────────────────────
@@ -71,6 +76,9 @@ message EncryptedPartial {
 message EncryptedShard {
   bytes  ciphertext  = 1;
   uint32 shard_index = 2;
+  bytes  signature   = 3;  // responder's recoverable secp256k1 signature (65 bytes) over
+                           // bind(method, caller_addr, shard_index, ciphertext); same origin +
+                           // integrity guarantee as EncryptedPartial.signature.
 }
 
 // ─── Gossip messages ──────────────────────────────────────────────────────────
