@@ -75,6 +75,9 @@ anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Daily-rotating log files with a hard retention cap (KMS_LOG_DIR). Needed so a log shipper can
+# read the node's log from a shared volume instead of the host docker socket.
+tracing-appender = "0.2"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

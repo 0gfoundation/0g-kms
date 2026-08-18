@@ -487,6 +487,12 @@ pub async fn send_start_reshare(
 /// it is the one that collected the partials — and without recording it there is no way to
 /// answer "who served this request" after the fact.
 pub struct DeriveTrace {
+    /// The node that coordinated this derive — its own shard index. It is always present in
+    /// `servers` too, but that list is sorted, so without this field there is no way to tell
+    /// which of the entries did the collecting. This is what identifies the node in the log:
+    /// the same `own_id` that /peers and the dashboard's node table report, so the log needs no
+    /// separately-configured hostname to say where it came from.
+    pub coordinator: u32,
     /// Polynomial epoch the combine ran on.
     pub epoch: u64,
     /// 1-based shard indices whose partial went into the combine, including this node's own.
@@ -621,7 +627,10 @@ pub async fn collect_and_dprf(
 
     let mut servers = contributors.remove(&epoch).unwrap_or_default();
     servers.sort_unstable();
-    Ok((sigma_to_app_key(&sigma), DeriveTrace { epoch, servers }))
+    Ok((
+        sigma_to_app_key(&sigma),
+        DeriveTrace { coordinator: own.shard_index, epoch, servers },
+    ))
 }
 
 // ─── Gossip background task ───────────────────────────────────────────────────

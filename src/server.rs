@@ -258,6 +258,7 @@ async fn app_key_inner(
     tracing::info!(
         app_id = %req.app_id,
         signer = ?recovered_addr,
+        coordinator = trace.coordinator,
         epoch = trace.epoch,
         // Comma-separated rather than Debug-formatted: `1,3` survives a log pipeline as a
         // plain string a query can match on, where `[1, 3]` would not.

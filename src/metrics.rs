@@ -323,8 +323,10 @@ mod probe_tests {
         assert!(!dir.join("share.sealed.probe").exists());
 
         // Stands in for the failure this metric exists to catch: the path is configured and
-        // looks fine, but a write cannot land.
-        assert_eq!(probe_share_path(Some("/nonexistent-mount/share.sealed")), 0, "unwritable path");
+        // looks fine, but a write cannot land. The parent here is a regular FILE, so the write
+        // fails with ENOTDIR — which holds even when the tests run as root, unlike a
+        // merely-absent directory that anything with privileges could create.
+        assert_eq!(probe_share_path(Some("/etc/hostname/share.sealed")), 0, "unwritable path");
 
         std::fs::remove_dir_all(&dir).ok();
     }
