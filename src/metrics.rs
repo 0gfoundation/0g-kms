@@ -27,6 +27,10 @@ pub struct Metrics {
     pub appkey_unauthorized: AtomicU64,
     /// This node has no share yet — it cannot even contribute its own partial.
     pub appkey_not_ready: AtomicU64,
+    /// The caller sent malformed input (bad hex, a pubkey that is not a curve point). Separate
+    /// from `appkey_error` because the service behaved correctly — folding the two together
+    /// makes an error-rate alert page for someone else's bug.
+    pub appkey_bad_request: AtomicU64,
     /// Everything else: partial collection short of threshold, crypto failure, bad input.
     pub appkey_error: AtomicU64,
 
@@ -105,6 +109,7 @@ impl Metrics {
             appkey_ok: AtomicU64::new(0),
             appkey_unauthorized: AtomicU64::new(0),
             appkey_not_ready: AtomicU64::new(0),
+            appkey_bad_request: AtomicU64::new(0),
             appkey_error: AtomicU64::new(0),
             dprf_discarded_malformed: AtomicU64::new(0),
             dprf_discarded_peer_error: AtomicU64::new(0),
@@ -614,10 +619,12 @@ pub async fn render(state: &AppState) -> String {
          # TYPE kms_appkey_requests_total counter\n\
          kms_appkey_requests_total{{result=\"ok\"}} {}\n\
          kms_appkey_requests_total{{result=\"unauthorized\"}} {}\n\
+         kms_appkey_requests_total{{result=\"bad_request\"}} {}\n\
          kms_appkey_requests_total{{result=\"not_ready\"}} {}\n\
          kms_appkey_requests_total{{result=\"error\"}} {}\n",
         m.appkey_ok.load(Relaxed),
         m.appkey_unauthorized.load(Relaxed),
+        m.appkey_bad_request.load(Relaxed),
         m.appkey_not_ready.load(Relaxed),
         m.appkey_error.load(Relaxed),
     );

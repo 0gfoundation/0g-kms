@@ -185,26 +185,64 @@ pub async fn handle_app_key(
     State(state): State<AppState>,
     Json(req): Json<AppKeyRequest>,
 ) -> Result<impl IntoResponse, KmsError> {
+    let app_id = req.app_id.clone();
+    let started = std::time::Instant::now();
     let r = app_key_inner(&state, req).await;
-    // Classify for `kms_appkey_requests_total`. Authorization failures are the caller's
-    // problem, "not ready" is this node's, and everything else needs a human — keeping them
-    // apart is what makes the counter alertable at all.
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    // One classification, used for both the counter and the log line, so the two can never tell
+    // different stories. The four buckets exist because they need different responses:
+    //   unauthorized — the caller is not entitled to this key; nothing to fix here
+    //   bad_request  — the caller sent malformed input; the service behaved correctly
+    //   not_ready    — this node holds no share yet; it will fix itself, or it is stuck
+    //   error        — genuinely ours, and the only one worth paging on
     let mt = crate::metrics::m();
-    crate::metrics::inc(match &r {
-        Ok(_) => &mt.appkey_ok,
+    let (counter, result) = match &r {
+        Ok(_) => (&mt.appkey_ok, "ok"),
         Err(KmsError::InvalidTimestamp(_))
         | Err(KmsError::InvalidSignature(_))
-        | Err(KmsError::AppNotFound(_)) => &mt.appkey_unauthorized,
-        Err(KmsError::ConfigError(_)) => &mt.appkey_not_ready,
-        Err(_) => &mt.appkey_error,
-    });
-    r
+        | Err(KmsError::AppNotFound(_)) => (&mt.appkey_unauthorized, "unauthorized"),
+        Err(KmsError::BadRequest(_)) => (&mt.appkey_bad_request, "bad_request"),
+        Err(KmsError::ConfigError(_)) => (&mt.appkey_not_ready, "not_ready"),
+        Err(_) => (&mt.appkey_error, "error"),
+    };
+    crate::metrics::inc(counter);
+
+    // Failures are logged too. Recording only successes leaves exactly the case an operator
+    // needs during an incident — "which field was malformed?" — with nothing to look at; the
+    // metric says a request failed, and the log is the only thing that can say why.
+    match &r {
+        Ok((_, trace)) => tracing::info!(
+            app_id = %app_id,
+            result,
+            coordinator = trace.coordinator,
+            epoch = trace.epoch,
+            // Comma-separated rather than Debug-formatted: `1,3` survives a log pipeline as a
+            // plain string a query can match on, where `[1, 3]` would not.
+            servers = %trace.servers.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","),
+            server_count = trace.servers.len(),
+            duration_ms,
+            "app-key issued"
+        ),
+        // The message is what the caller already received, so logging it leaks nothing new.
+        Err(e) => tracing::warn!(
+            app_id = %app_id,
+            result,
+            error = %e,
+            duration_ms,
+            "app-key failed"
+        ),
+    }
+
+    r.map(|(resp, _)| resp)
 }
 
+/// The derive itself. Returns the response together with the trace of who served it, so the
+/// caller can log success and failure through one path.
 async fn app_key_inner(
     state: &AppState,
     req: AppKeyRequest,
-) -> Result<impl IntoResponse, KmsError> {
+) -> Result<(impl IntoResponse, crate::grpc::DeriveTrace), KmsError> {
     // 1. Validate timestamp
     let now = chrono::Utc::now().timestamp();
     if (now - req.timestamp).abs() > state.config.server.timestamp_tolerance_secs {
@@ -241,43 +279,25 @@ async fn app_key_inner(
     // 3. Threshold-BLS DPRF: collect partials from ≥ threshold nodes and combine them into
     //    the app key, bound to (app_id, material). The master is never reconstructed.
     let material = hex::decode(req.material.trim_start_matches("0x"))
-        .map_err(|_| KmsError::CryptoError("invalid material hex".into()))?;
-    let started = std::time::Instant::now();
+        .map_err(|_| KmsError::BadRequest("invalid material hex".into()))?;
     let (app_key, trace) = collect_and_dprf(state, &req.app_id, &material).await?;
 
     // 4. ECIES encrypt for caller
     let pubkey_bytes = hex::decode(req.pubkey.trim_start_matches("0x"))
-        .map_err(|_| KmsError::CryptoError("invalid pubkey hex".into()))?;
-    let ciphertext = ecies_encrypt(&pubkey_bytes, &app_key)?;
-
-    // Per-request service record. This is the only place the "which nodes served it" answer
-    // exists — the coordinator collected the partials, and nothing else on the cluster sees the
-    // set. It belongs in the log rather than in a metric: one series per request would blow up
-    // cardinality, and the caller identity below is deliberately kept out of /metrics labels,
-    // where it would be world-readable.
-    tracing::info!(
-        app_id = %req.app_id,
-        signer = ?recovered_addr,
-        coordinator = trace.coordinator,
-        epoch = trace.epoch,
-        // Comma-separated rather than Debug-formatted: `1,3` survives a log pipeline as a
-        // plain string a query can match on, where `[1, 3]` would not.
-        servers = %trace
-            .servers
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-        server_count = trace.servers.len(),
-        duration_ms = started.elapsed().as_millis() as u64,
-        "app-key issued"
-    );
+        .map_err(|_| KmsError::BadRequest("invalid pubkey hex".into()))?;
+    // The only realistic failure here is the caller's pubkey not being a valid curve point —
+    // `app_key` is ours and always well-formed — so this is the caller's mistake, not ours.
+    let ciphertext = ecies_encrypt(&pubkey_bytes, &app_key)
+        .map_err(|e| KmsError::BadRequest(format!("cannot encrypt to caller pubkey: {}", e)))?;
 
     Ok((
-        StatusCode::OK,
-        Json(AppKeyResponse {
-            encrypted_secret: hex::encode(ciphertext),
-        }),
+        (
+            StatusCode::OK,
+            Json(AppKeyResponse {
+                encrypted_secret: hex::encode(ciphertext),
+            }),
+        ),
+        trace,
     ))
 }
 
