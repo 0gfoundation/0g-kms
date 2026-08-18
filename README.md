@@ -39,6 +39,7 @@ Each node signs the derivation message with its own share locally; the coordinat
 | `proto/kms_cluster.proto` | inter-node protocol (DPRF partials, gossip, DKG rounds, reshare) |
 | `docs/CLUSTER.md` | lifecycle & API guide: init / join / rejoin / derive / auth / refresh |
 | `docs/TESTNET_E2E.md` | real-TEE + testnet end-to-end runbook (deploy, node replacement, …) |
+| `deploy/` | deployment templates: per-node compose (kms + TLS + log shipping) and the central monitoring host |
 | `test/local-cluster/` | self-contained 3-node e2e harness (mock chain + mock TEE, builds from source) |
 | `examples/dprf_client.rs` | reference `/app-key` client (EIP-191 sign + ECIES decrypt) |
 | `vendor/uint-zigzag` | in-tree std-only fork un-rotting a yanked transitive dep (`core2`) |
@@ -61,38 +62,37 @@ See `test/local-cluster/README.md` for the full scenario list (threshold, recove
 ### Production (real TEE + on-chain registry)
 
 One node per host, deployed as a tapp. Build & push the image (`Dockerfile`; needs `protoc` if
-building natively), give each host its own `kms.toml`, register the nodes in TappRegistry, and
-start via tapp-cli — the nodes discover each other, wait for the full nodeList, and run genesis
-together. Full runbook: `docs/TESTNET_E2E.md`; lifecycle reference: `docs/CLUSTER.md`.
+building natively), give each host its own config, register the nodes in TappRegistry, and start
+via tapp-cli — the nodes discover each other, wait for the full nodeList, and run genesis
+together.
 
-## Configuration (`kms.toml`)
+Ready-to-fill templates for the whole stack (node compose, TLS, log shipping, and the central
+Prometheus/Loki/Grafana host) are in **[`deploy/`](deploy/)**. Full runbook:
+`docs/TESTNET_E2E.md`; lifecycle reference: `docs/CLUSTER.md`.
+
+## Configuration
+
+Each node gets its own config file. Start from **[`deploy/kms.toml.example`](deploy/kms.toml.example)**
+— it is the single source of truth for the field set, so it cannot drift from a second copy pasted
+into this README.
+
+Only three fields differ between nodes: `self_url`, `seeds`, and (per environment) `app_id`.
 
 ```toml
-[server]
-bind      = "0.0.0.0:9090"   # HTTP: /app-key /refresh /peers /sealed-share
-grpc_bind = "0.0.0.0:9092"   # inter-node gRPC
-
-[tapp]
-app_id     = "my-kms"        # KMS's own app_id in TappRegistry
-tapp_ip    = "host.docker.internal"
-tapp_port  = 50051
-# tapp_socket = "/run/tapp/tapp.sock"   # optional Unix-socket to the local tapp-server
-# mock_tee = true              # dev/CI only: key from MOCK_APP_PRIVATE_KEY env
-
-[chain]
-rpc_url          = "https://evmrpc-testnet.0g.ai"
-contract_address = "0x…"       # TappRegistry
-
 [cluster]
 threshold   = 2
-total_nodes = 4
+total_nodes = 5
 self_url    = "http://<this-node-ip>:9092"   # how peers reach THIS node
-seeds       = ["http://<peer-ip>:9092", …]   # bootstrap contacts (list several)
-# sealed_share      = "<base64url>"      # reload this share at boot (omit = fresh start)
-# sealed_share_path = "/data/share.seal" # auto-persist target (needs a durable volume)
+seeds       = ["http://<peer-ip>:9092", …]   # MESH — list every other peer, not just one
+sealed_share_path = "/var/lib/kms/share.sealed"   # durable volume; enables restart without rejoin
 ```
 
-`KMS_SEALED_SHARE` / `KMS_SEALED_SHARE_PATH` env vars override the two sealed-share fields.
+`seeds` must list **every** other peer. A restarted node asks `seeds` for its share; if that list
+held only one node and that node were down, it would see "no seed reachable" and wrongly start a
+fresh genesis.
+
+`KMS_SEALED_SHARE` / `KMS_SEALED_SHARE_PATH` override the two sealed-share fields.
+`KMS_LOG_FORMAT=json` and `KMS_LOG_DIR=<dir>` control logging — see Monitoring below.
 
 ## HTTP API
 
