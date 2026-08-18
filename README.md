@@ -134,6 +134,7 @@ Other signals worth a rule:
 | `kms_share_path_writable == 0` | the durable path stopped accepting writes; a read-only remount looks healthy everywhere else |
 | `kms_dprf_partials_last == kms_threshold` | derives have no spare holder left |
 | `kms_chain_stale_served_total` climbing | authorization is running on a nodeList that is no longer refreshing |
+| `kms_appkey_requests_total{result="bad_request"}` rising | a *client* is sending malformed input — the KMS is rejecting it correctly with 400; excluded from the error-rate alert on purpose |
 
 ### Judging the master
 
@@ -162,14 +163,47 @@ After a TEE identity change the sealed share can no longer be opened, so the nod
 memory at all and will accept whatever master the committee hands it — the baseline is the only
 anchor that survives exactly the event that destroys every other one.
 
+Two limits are worth stating plainly, because both are easy to assume away:
+
+**It anchors, it does not validate.** The first formation after upgrading writes whatever master
+that node is holding, and treats it as truth from then on. If a node were already on the wrong
+side of a fork at that moment, it would record the wrong value and agree with itself forever
+after. So the fleet must be verified consistent *before* the first node records a baseline —
+that is the one moment where a human still has to look:
+
+```bash
+# every node must print the same value
+tapp-cli --server http://<node>:50051 get-app-logs --app-id <app> --service kms -n 500 \
+  | grep -o 'group_pubkey=[0-9a-f]*' | tail -1
+```
+
+Once every node is upgraded the fleet-wide count above takes over and this is no longer manual.
+
+**It dies with the volume.** The baseline lives on the same durable path as the sealed share, so
+losing that disk loses both: the node rejoins with no memory and records the master it is handed.
+It protects the case where the disk survives but the TEE identity does not (a VM restart) — which
+is the common one — and nothing beyond that. Fleet-wide counting is what covers the rest.
+
 ### Per-request service log
 
-Every successful derive logs `app-key issued` with `app_id`, `signer`, `epoch`, `servers`
-(the shard indices whose partials were combined), `server_count` and `duration_ms`. The
-coordinator is the only party that knows which nodes served a request, so without this the answer
-does not exist anywhere after the fact.
+Every derive is logged, successful or not, with `result` distinguishing them:
 
-This is a log line, not a metric: one series per request would blow up cardinality, and the
+```
+app-key issued   result=ok           app_id=… coordinator=3 epoch=9 servers=1,3 duration_ms=8
+app-key failed   result=bad_request  app_id=… error="bad request: invalid material hex"
+```
+
+`coordinator` is the node that collected the partials — the same `own_id` that `/peers` and the
+node table report. It is in the line rather than a log label so the collector needs no per-host
+configuration to say where a record came from.
+
+Failures are logged too, and that is not decorative: the metrics can narrow an incident down to
+"not the cluster", but only the log says *which field* was malformed. `KMS_LOG_FORMAT=json` makes
+these fields machine-parseable; `KMS_LOG_DIR` additionally writes daily-rotating files (7 kept,
+capped in code) so a shipper can read them from a shared volume instead of being handed the
+host's docker socket.
+
+This stays a log rather than a metric: one series per request would blow up cardinality, and the
 caller identity is kept out of `/metrics` labels, where it would be world-readable.
 
 ## Operational invariants
