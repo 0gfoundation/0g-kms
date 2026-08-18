@@ -1,0 +1,91 @@
+# KMS node stack (TLS). Template — fill in the registry/tag and provide the mounted files
+# (kms.toml, config.alloy, .env) alongside this compose before deploying.
+#
+#   kms       — the KMS server (HTTP :9090, inter-node gRPC :9092)
+#   tls-init  — fetches an attested TLS cert into /run (tmpfs, in memory) and exits
+#   nginx     — HTTPS reverse proxy on :9443 in front of kms:9090
+#   alloy     — ships the KMS log file to the central Loki (reads a file, not docker.sock)
+services:
+  tls-init:
+    image: REGISTRY/tls-init:TAG
+    command:
+      - --server=/run/tapp/tapp.sock
+      - get-app-tls-cert
+      - --app-id=APP_ID
+      - --out-key=/certs/tls.key
+      - --out-cert=/certs/tls.crt
+    volumes:
+      - /run/tapp/tapp.sock:/run/tapp/tapp.sock
+      - /run/kms-certs:/certs          # host /run is tmpfs → the private key stays in memory
+
+  kms:
+    image: REGISTRY/0g-kms:TAG
+    pull_policy: always
+    command: ["kms-server", "/config/kms.toml"]
+    environment:
+      # Structured logs so the monitoring stack can index fields.
+      KMS_LOG_FORMAT: json
+      # Also write log files here (daily rotation, retention fixed in code) for alloy to read.
+      # Absolute path on purpose: a KMS node cannot use FDE (the encrypted-volume password is
+      # derived by the KMS cluster itself — a circular dependency), so a named volume would land
+      # on the small system disk instead of being redirected into the encrypted volume.
+      KMS_LOG_DIR: "/var/log/kms"
+    ports:
+      - "9090:9090"   # HTTP: /app-key /refresh /sealed-share /peers /health /ready /metrics
+      - "9092:9092"   # inter-node gRPC (gossip + DKG)
+    # Probe /health (process up), NOT /ready (holds a share) — a node waiting to rejoin is doing
+    # its job; restarting it there throws away progress. The image ships curl for the probe.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    volumes:
+      - ./kms.toml:/config/kms.toml:ro
+      - /run/tapp/tapp.sock:/run/tapp/tapp.sock
+      - /data/kms:/var/lib/kms
+      - /data/kms-logs:/var/log/kms
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+      kms:
+        condition: service_started
+    ports:
+      - "9443:443"
+    volumes:
+      - /run/kms-certs:/etc/nginx/certs:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  # Log shipper: reads the KMS log file off a shared volume and pushes it to the central Loki.
+  # Deliberately does NOT mount the host docker.sock — that would hand this agent control of every
+  # container on the host just to read one log. The KMS writes its own file via KMS_LOG_DIR and
+  # this agent mounts that directory read-only. The KMS still writes stdout, so `get-app-logs`
+  # is unaffected.
+  alloy:
+    image: grafana/alloy:v1.5.1
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    environment:
+      # Central Loki URL comes from .env: an operational endpoint that must not be baked into
+      # the measured compose. No node label — each line carries `coordinator` (= own_id), so
+      # `| json | coordinator="3"` tells nodes apart in Loki.
+      LOKI_URL: ${LOKI_URL:?set LOKI_URL in .env}
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      - ./.env:/etc/alloy/.env:ro             # only so the deploy tool uploads .env for ${LOKI_URL} interpolation
+      - /data/kms-logs:/var/log/kms:ro        # read-only: it can read only the one log it should
+      - /data/kms-alloy:/var/lib/alloy/data   # read positions, so a restart does not re-ship
+    deploy:
+      resources:
+        limits:
+          memory: 256M

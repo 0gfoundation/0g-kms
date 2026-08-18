@@ -1,0 +1,57 @@
+# Central monitoring for the KMS cluster: scrape, store, alert, display.
+#
+#   GRAFANA_PASSWORD=<pick one> docker compose up -d   → Grafana on :3000
+#
+# Runs on ONE host that is NOT a KMS node. Two reasons: a KMS host that dies takes its own
+# monitoring with it, and — more fundamentally — a cluster member is the wrong party to judge
+# whether the cluster is healthy. During a fork every node believes it is on the correct side.
+# Only something outside the committee can count the sides. A host that already polls these nodes
+# is the natural home.
+#
+# The Loki port must be reachable by the KMS nodes (they push to it) and the Grafana port by
+# operators. Pick ports already open in the host firewall / cloud security group, or open them.
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=90d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+
+  loki:
+    image: grafana/loki:3.3.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./loki-config.yml:/etc/loki/loki-config.yml:ro
+      - lokidata:/loki
+    ports:
+      # The per-node alloy agents push here. Restrict this to the KMS hosts.
+      - "3100:3100"
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    restart: unless-stopped
+    depends_on: [prometheus, loki]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+volumes:
+  promdata:
+  lokidata:
+  grafanadata:

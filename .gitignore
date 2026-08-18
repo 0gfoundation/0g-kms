@@ -1,1 +1,10 @@
 /target
+
+# Ephemeral per-host deploy slot: the current node's config is copied here at deploy
+# time (from kms.toml / kms-*-test.toml). Throwaway, never committed.
+kms-deploy.toml
+
+# Filled-in deployment values (copy from deploy/*.example). Never committed: these carry real
+# hosts and per-node identity, and the templates next to them are what belongs in git.
+deploy/.env
+deploy/kms.toml

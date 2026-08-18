@@ -1,0 +1,71 @@
+// Ships this node's KMS log to the central Loki.
+//
+// Reads a FILE off a shared volume, not the host's docker socket. The socket is the usual way to
+// collect container logs, but handing it to a container grants full control of every container on
+// the host — an enormous grant in exchange for reading one log. The KMS writes its own log to
+// /var/log/kms (KMS_LOG_DIR) and this agent mounts that directory read-only, so the worst it can
+// do is read what it is meant to read.
+//
+// The KMS keeps writing to stdout as well, so `tapp-cli get-app-logs` is unaffected either way.
+
+logging {
+  level  = "warn"
+  format = "logfmt"
+}
+
+local.file_match "kms" {
+  path_targets = [{
+    __path__ = "/var/log/kms/kms.*.log",
+    job      = "kms",
+  }]
+  // The KMS rotates daily; re-scan often enough that a new day's file is picked up promptly.
+  sync_period = "30s"
+}
+
+// Deliberately no per-node label. Which node handled a request is already in the line itself —
+// the KMS logs `coordinator`, the same own_id that /peers and the dashboard's node table use, so
+// `| json | coordinator="3"` answers it. Adding a label here would mean either injecting a
+// hostname per deployment (five different compose files) or passing an env var the tapp deploy
+// path cannot supply, to duplicate information the log already carries.
+
+loki.source.file "kms" {
+  targets    = local.file_match.kms.targets
+  forward_to = [loki.process.kms.receiver]
+  // Positions are stored under the agent's data dir, so a restart resumes where it left off
+  // instead of re-shipping the whole file.
+  tail_from_end = false
+}
+
+loki.process "kms" {
+  forward_to = [loki.write.central.receiver]
+
+  // The KMS emits one JSON object per event when KMS_LOG_FORMAT=json. Parse it so the fields are
+  // queryable, and lift the event timestamp so ingestion delay cannot reorder anything.
+  stage.json {
+    expressions = {
+      level     = "level",
+      timestamp = "timestamp",
+      message   = "message",
+    }
+  }
+
+  stage.timestamp {
+    source = "timestamp"
+    format = "RFC3339Nano"
+  }
+
+  // `level` only. Deliberately NOT app_id, signer, or servers: those are unbounded or
+  // caller-controlled, and one label per value would blow up Loki's index. They stay inside the
+  // line, where `| json | app_id="…"` finds them just as well.
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+}
+
+loki.write "central" {
+  endpoint {
+    url = sys.env("LOKI_URL")
+  }
+}

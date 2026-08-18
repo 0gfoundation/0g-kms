@@ -1,0 +1,30 @@
+# Per-node KMS config. Copy to kms.toml on each node and fill in the values below.
+# Every field marked <...> is node- or deployment-specific.
+
+[server]
+bind = "0.0.0.0:9090"
+grpc_bind = "0.0.0.0:9092"
+timestamp_tolerance_secs = 300
+
+[tapp]
+app_id = "<APP_ID>"                      # on-chain app id, e.g. "0g-kms"
+tapp_socket = "/run/tapp/tapp.sock"
+mock_tee = false
+
+[chain]
+rpc_url = "<RPC_URL>"                     # chain RPC endpoint
+contract_address = "<TAPP_REGISTRY_ADDRESS>"
+
+[cluster]
+threshold = 2                            # partials needed to derive (t of n)
+total_nodes = 5                          # n
+sealed_share_path = "/var/lib/kms/share.sealed"
+# This node's own gossip URL (its internal IP, reachable by the other nodes).
+self_url = "http://<THIS_NODE_INTERNAL_IP>:9092"
+# The other n-1 nodes' gossip URLs.
+seeds = [
+  "http://<PEER_1_INTERNAL_IP>:9092",
+  "http://<PEER_2_INTERNAL_IP>:9092",
+  "http://<PEER_3_INTERNAL_IP>:9092",
+  "http://<PEER_4_INTERNAL_IP>:9092",
+]
