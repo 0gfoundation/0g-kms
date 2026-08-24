@@ -1,0 +1,255 @@
+# KMS alert rules, one per invariant in SECURITY.md section 4.
+#
+# The ordering principle: the cluster loses the ability to HEAL long before it loses the ability
+# to SERVE, and it gives no outward sign when it crosses that line. Every P0 below fires while
+# derives are still succeeding normally.
+groups:
+  - name: kms-cluster
+    rules:
+      # ── I1: self-healing capacity ─────────────────────────────────────────
+      # The line that matters. Below it a shardless node can no longer rejoin: reshare recovery
+      # needs `threshold` dealers AND a committee majority, so for a node holding nothing the
+      # binding constraint is max(t, floor(n/2)).
+      #
+      # `max()` across nodes on purpose: if even the most optimistic view is short, it is short.
+      # Using min() would page every time one node's gossip briefly lagged.
+      - alert: KmsCannotSelfHeal
+        expr: max(kms_leading_holders) < max(kms_recovery_threshold)
+        for: 5m
+        labels: {severity: P0}
+        annotations:
+          summary: "KMS has lost self-healing capacity ({{ $value }} leading holders)"
+          description: >-
+            Live holders on the leading epoch have dropped below max(threshold, floor(n/2)).
+            Derives still work and every other signal is green, but no node can rejoin from
+            here and the cluster cannot grow back. Stop all maintenance. Bring holders back
+            first — the only route that works this low is the sealed-share fast path on nodes
+            whose TEE identity has not changed.
+
+      - alert: KmsSelfHealingAtFloor
+        expr: max(kms_leading_holders) == max(kms_recovery_threshold)
+        for: 10m
+        labels: {severity: P0}
+        annotations:
+          summary: "KMS is one node away from losing self-healing"
+          description: >-
+            Exactly at the recovery threshold. One more loss enters the state above. Do not
+            start any maintenance, upgrade, or restart.
+
+      # ── I1b: the irreversible line ────────────────────────────────────────
+      - alert: KmsApproachingMasterLoss
+        expr: max(kms_leading_holders) <= max(kms_threshold)
+        for: 1m
+        labels: {severity: P0}
+        annotations:
+          summary: "KMS at the service threshold — master loss is one node away"
+          description: >-
+            Holders are down to the number needed to derive at all. Losing one more makes the
+            master unrecoverable by any means. This is the only truly irreversible line.
+
+      # ── I2: one master ────────────────────────────────────────────────────
+      # Counted across the fleet rather than trusted from any node: on a fork each side reports
+      # its own master with equal confidence, which is exactly what makes counting work.
+      - alert: KmsMasterForked
+        expr: count(count by (hash) (kms_group_pubkey_info)) > 1
+        for: 2m
+        labels: {severity: P0}
+        annotations:
+          summary: "KMS cluster has more than one master"
+          description: >-
+            Nodes report differing group public keys. Keys derived on one side cannot be
+            reproduced on the other. Identify the minority side and isolate it before it
+            gossips its epoch further.
+
+      # The check above only sees the present. If the whole cluster moved to a new master at
+      # once — a re-genesis, deliberate or not — every node reports the same new hash and the
+      # count is still 1. This one looks back instead, so a fleet-wide change cannot pass
+      # unnoticed. It is independent of each node's own master.baseline: that is the node's own
+      # judgement, this is counted from outside.
+      #
+      # `last_over_time` is what turns the range into something countable — a bare range vector
+      # cannot be aggregated. The window is 7d rather than the full retention: this rule is
+      # evaluated every 30s, and scanning months of history each time buys nothing. Anything
+      # older is covered by each node's master.baseline, which never expires.
+      - alert: KmsMasterChangedOverTime
+        expr: count(count by (hash) (last_over_time(kms_group_pubkey_info[7d]))) > 1
+        for: 5m
+        labels: {severity: P0}
+        annotations:
+          summary: "More than one master seen for this cluster in the last 7 days"
+          description: >-
+            The cluster's group public key changed at some point in the last week. If a
+            re-genesis was deliberate, this is expected and clears once the old value ages out —
+            confirm it was intentional and that master.baseline was cleared on every node.
+            Otherwise the cluster forked and keys derived before the change are not reproducible.
+
+      - alert: KmsMasterChangedFromBaseline
+        expr: kms_master_matches_baseline == 0
+        for: 2m
+        labels: {severity: P0}
+        annotations:
+          summary: "{{ $labels.node }} master differs from its recorded baseline"
+          description: >-
+            This node's master is not the one it recorded when it first formed. Either the
+            cluster forked, or a re-genesis was run without deleting master.baseline. If the
+            re-genesis was deliberate, clear the baseline on every node; otherwise treat as a
+            fork.
+
+      # ── I8: single-node recovery time ─────────────────────────────────────
+      # The incident lesson: the committee's whole fault tolerance is spent in units of this
+      # number, and when it goes unbounded the margin disappears within hours.
+      - alert: KmsNodeStuckShardless
+        expr: kms_shardless_seconds > 1800
+        for: 5m
+        labels: {severity: P0}
+        annotations:
+          summary: "{{ $labels.node }} has had no share for {{ $value | humanizeDuration }}"
+          description: >-
+            Recovery is not converging on its own. Check whether this node's signer is still in
+            the on-chain nodeList — after a TEE identity change it must be migrated with
+            update-node-onchain (never remove + add) before it can rejoin.
+
+      - alert: KmsRecoveryTimeDegrading
+        expr: max(kms_last_recovery_seconds) > 900
+        for: 15m
+        labels: {severity: P1}
+        annotations:
+          summary: "Single-node recovery took {{ $value | humanizeDuration }}"
+          description: >-
+            The measured recovery budget must stay well under the smallest observed gap between
+            maintenance windows (4h). Investigate before it stops fitting.
+
+      # ── I7: epoch convergence ─────────────────────────────────────────────
+      # Not an emergency by itself: the fall-behind watchdog re-syncs a stranded node within a
+      # couple of minutes. It becomes a problem only when the watchdog cannot make progress.
+      - alert: KmsNodeStrandedOnStaleEpoch
+        expr: kms_epoch_lag > 0
+        for: 10m
+        labels: {severity: P1}
+        annotations:
+          summary: "{{ $labels.node }} is {{ $value }} epochs behind"
+          description: >-
+            The watchdog has not managed to catch this node up. While behind, it contributes
+            nothing to derives and blocks /refresh, which requires a single epoch cluster-wide.
+
+      # ── Durability ────────────────────────────────────────────────────────
+      - alert: KmsSealedSharePersistFailing
+        expr: increase(kms_sealed_persist_failures_total[15m]) > 0
+        labels: {severity: P0}
+        annotations:
+          summary: "{{ $labels.node }} cannot persist its sealed share"
+          description: >-
+            Harmless while the process keeps running, fatal at the next restart: the node would
+            have to rejoin instead of reloading, which needs a healthy committee and consumes
+            recovery budget it may not have.
+
+      - alert: KmsSharePathNotWritable
+        expr: kms_share_path_writable == 0
+        for: 5m
+        labels: {severity: P0}
+        annotations:
+          summary: "{{ $labels.node }} durable path is not writable"
+          description: >-
+            The sealed-share path rejects writes. A filesystem that remounted read-only looks
+            perfectly healthy on every other signal — this is the layer the 2026-08-04 incident
+            died on.
+
+      # ── Serving ───────────────────────────────────────────────────────────
+      # Counts only failures the service is responsible for. `unauthorized` and `bad_request`
+      # are both the caller's — a burst of malformed input is not a KMS incident, and folding it
+      # in here means paging on someone else's deploy. Observed for real on 2026-08-18: 171
+      # malformed-material requests in ten minutes, with every cluster-side signal clean.
+      - alert: KmsDeriveErrorRate
+        expr: >-
+          sum(rate(kms_appkey_requests_total{result=~"error|not_ready"}[10m]))
+          / clamp_min(sum(rate(kms_appkey_requests_total[10m])), 0.001) > 0.05
+        for: 10m
+        labels: {severity: P1}
+        annotations:
+          summary: "KMS derive error rate is {{ $value | humanizePercentage }}"
+          description: >-
+            Counts only `error` and `not_ready`. Callers sending bad signatures or malformed
+            input show up as `unauthorized` / `bad_request` and are excluded — check those
+            separately if a client is misbehaving.
+
+      # Not paging severity: it says a client is broken, not that the KMS is. Worth surfacing
+      # because the caller may not be watching their own error rate.
+      - alert: KmsMalformedRequests
+        expr: sum(rate(kms_appkey_requests_total{result="bad_request"}[10m])) > 0.1
+        for: 15m
+        labels: {severity: P2}
+        annotations:
+          summary: "Callers are sending malformed app-key requests"
+          description: >-
+            Bad hex in `material`/`pubkey`, or a pubkey that is not a valid curve point. The KMS
+            is rejecting them correctly with 400. Find the client with:
+            {job="kms"} |= "app-key failed" | json | result="bad_request"
+
+      - alert: KmsPartialCollectionDegraded
+        expr: sum(rate(kms_dprf_discarded_total[15m])) > 0
+        for: 15m
+        labels: {severity: P1}
+        annotations:
+          summary: "Peers are failing during partial collection"
+          description: >-
+            Partials are being dropped as unreachable or malformed. Derives still succeed while
+            enough healthy holders remain, so this is the early warning before they stop.
+            (There is deliberately no "partials per derive" alert: collection stops the moment
+            one epoch reaches threshold, so that number is always exactly threshold and says
+            nothing about spare capacity. Spare capacity is kms_leading_holders.)
+
+      # ── Dependencies ──────────────────────────────────────────────────────
+      - alert: KmsNodeGossipSilent
+        expr: kms_gossip_last_success_age_seconds > 300
+        for: 5m
+        labels: {severity: P1}
+        annotations:
+          summary: "{{ $labels.node }} has not reached any peer for {{ $value | humanizeDuration }}"
+          description: >-
+            This node is partitioned. Its peer view is going stale, and other nodes will stop
+            counting it as live — the earliest signal of a network split.
+
+      - alert: KmsChainServingStaleNodeList
+        expr: increase(kms_chain_stale_served_total[15m]) > 0
+        labels: {severity: P1}
+        annotations:
+          summary: "{{ $labels.node }} is authorizing against a stale nodeList"
+          description: >-
+            Chain RPC failures are being absorbed by the cache. Membership changes will not be
+            seen until the RPC recovers.
+
+      - alert: KmsMembershipFailing
+        expr: increase(kms_membership_failures_total[15m]) > 5
+        labels: {severity: P1}
+        annotations:
+          summary: "{{ $labels.node }} cannot assemble the committee"
+          description: >-
+            Either the chain lookup is failing, or this node's signer is not in the on-chain
+            nodeList — the latter needs update-node-onchain and will retry forever until then.
+
+      # ── The monitoring itself ─────────────────────────────────────────────
+      - alert: KmsNodeDown
+        expr: up{job="kms"} == 0
+        for: 2m
+        labels: {severity: P0}
+        annotations:
+          summary: "{{ $labels.node }} is not responding to scrapes"
+
+      - alert: KmsAllNodesGone
+        expr: absent(up{job="kms"})
+        for: 2m
+        labels: {severity: P0}
+        annotations:
+          summary: "No KMS node is being scraped at all"
+          description: >-
+            Every other KMS alert in this file goes quiet when this fires, because they all
+            depend on metrics that no longer exist. Silence is not health.
+
+      # Dead man's switch: always firing. Point an external watchdog at it, so that a
+      # Prometheus or Alertmanager outage — which would silence every rule above — is itself
+      # visible from outside.
+      - alert: KmsMonitoringHeartbeat
+        expr: vector(1)
+        labels: {severity: heartbeat}
+        annotations:
+          summary: "Monitoring is alive; alert if this stops arriving"

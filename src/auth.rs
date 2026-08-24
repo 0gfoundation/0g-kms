@@ -107,6 +107,34 @@ pub fn eth_address_from_pubkey(pubkey: &[u8]) -> Address {
     Address::from_slice(&hash[12..])
 }
 
+/// Recover the signer's Ethereum address from a recoverable signature over `message`.
+pub fn recover_signer_address(message: &[u8], sig_bytes: &[u8]) -> Result<Address> {
+    if sig_bytes.len() != 65 {
+        return Err(anyhow!("signature must be 65 bytes, got {}", sig_bytes.len()));
+    }
+    let pubkey = recover_pubkey(message, sig_bytes)?;
+    Ok(eth_address_from_pubkey(&pubkey))
+}
+
+/// Verify a cluster ECIES-response signature: the signer of `message` must be a node
+/// currently registered in the on-chain nodeList. Confirms both origin (a real cluster
+/// member produced the response) and integrity (`message` binds the ciphertext + metadata).
+/// Callers MUST run this before decrypting/using a peer's ECIES response.
+pub async fn verify_cluster_response(message: &[u8], sig_bytes: &[u8], config: &Config) -> Result<()> {
+    let signer = recover_signer_address(message, sig_bytes)?;
+    let nodes = get_signer_addresses(
+        &config.chain.rpc_url,
+        &config.chain.contract_address,
+        &config.tapp.app_id,
+    )
+    .await
+    .map_err(|e| anyhow!("nodeList lookup failed: {}", e))?;
+    if !nodes.contains(&signer) {
+        return Err(anyhow!("response signer {:?} is not a registered node", signer));
+    }
+    Ok(())
+}
+
 /// Verify that `addr` is registered in getNodeList(own_app_id) on-chain.
 async fn verify_on_chain(addr: &Address, config: &Config) -> Result<()> {
     let signers = get_signer_addresses(

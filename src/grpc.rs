@@ -4,11 +4,11 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::{
-    auth::authenticate,
+    auth::{authenticate, verify_cluster_response},
     crypto::{
-        dprf_message, dprf_partial, dprf_sigma, dprf_verify, ecies_decrypt, ecies_encrypt,
-        sigma_to_app_key,
-        partial_from_bytes, partial_to_bytes, share_from_bytes, sign_request,
+        dprf_message, dprf_partial, dprf_partial_signing_msg, dprf_sigma, dprf_verify,
+        ecies_decrypt, ecies_encrypt, shard_signing_msg, sigma_to_app_key,
+        partial_from_bytes, partial_to_bytes, share_from_bytes, sign_bytes, sign_request,
     },
     error::KmsError,
     server::{AppState, PeerInfo},
@@ -70,10 +70,20 @@ impl KmsCluster for KmsClusterService {
                 Status::internal("encryption failed")
             })?;
 
+        // Sign the ciphertext (bound to caller + metadata) so the coordinator can verify the
+        // partial came from us unmodified — ECIES alone would let an attacker substitute it.
+        let caller_addr: [u8; 20] = ctx.caller_eth_addr.into();
+        let msg = dprf_partial_signing_msg(&caller_addr, shard.shard_index, shard.epoch, &ciphertext);
+        let signature = sign_bytes(&self.state.signing_key.private_key, &msg).map_err(|e| {
+            tracing::error!(error = %e, "partial response signing failed");
+            Status::internal("response signing failed")
+        })?;
+
         Ok(Response::new(EncryptedPartial {
             ciphertext,
             shard_index: shard.shard_index,
             epoch: shard.epoch,
+            signature,
         }))
     }
 
@@ -98,9 +108,17 @@ impl KmsCluster for KmsClusterService {
                 Status::internal("encryption failed")
             })?;
 
+        let caller_addr: [u8; 20] = ctx.caller_eth_addr.into();
+        let msg = shard_signing_msg("GetShardContribution", &caller_addr, shard.shard_index, &ciphertext);
+        let signature = sign_bytes(&self.state.signing_key.private_key, &msg).map_err(|e| {
+            tracing::error!(error = %e, "shard response signing failed");
+            Status::internal("response signing failed")
+        })?;
+
         Ok(Response::new(EncryptedShard {
             ciphertext,
             shard_index: shard.shard_index,
+            signature,
         }))
     }
 
@@ -154,6 +172,7 @@ impl KmsCluster for KmsClusterService {
                         last_seen: now,
                         pubkey: ctx.caller_pubkey.clone(),
                         epoch: info.epoch,
+                        group_pubkey: info.group_pubkey.clone(),
                     },
                 );
                 if is_new {
@@ -174,6 +193,7 @@ impl KmsCluster for KmsClusterService {
                 eth_addr: hex::encode(addr),
                 pubkey: info.pubkey.clone(),
                 epoch: info.epoch,
+                group_pubkey: info.group_pubkey.clone(),
             })
             .collect();
 
@@ -232,16 +252,17 @@ impl KmsCluster for KmsClusterService {
         // synchronises with the recovering node + other dealers via the DkgRound barrier.
         let state = self.state.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                crate::init::run_reshare_dealer(
-                    &state,
-                    req.session_id,
-                    req.recovering_id,
-                    req.dealer_ids,
-                    req.epoch,
-                )
-                .await
-            {
+            let r = crate::init::run_reshare_dealer(
+                &state,
+                req.session_id,
+                req.recovering_id,
+                req.dealer_ids,
+                req.epoch,
+            )
+            .await;
+            let mt = crate::metrics::m();
+            crate::metrics::record(&mt.dealer_ok, &mt.dealer_fail, &r);
+            if let Err(e) = r {
                 tracing::error!(error = %e, "reshare dealer session failed");
             }
         });
@@ -293,9 +314,17 @@ impl KmsClusterService {
             Status::internal("encryption failed")
         })?;
 
+        let addr_bytes: [u8; 20] = caller_addr.into();
+        let msg = shard_signing_msg("RequestShard", &addr_bytes, *shard_index, &ciphertext);
+        let signature = sign_bytes(&self.state.signing_key.private_key, &msg).map_err(|e| {
+            tracing::error!(error = %e, "init-shard response signing failed");
+            Status::internal("response signing failed")
+        })?;
+
         Ok(Some(EncryptedShard {
             ciphertext,
             shard_index: *shard_index,
+            signature,
         }))
     }
 
@@ -328,6 +357,8 @@ pub async fn get_dprf_partial(
     sig: &[u8],
     timestamp: i64,
     own_private_key: &[u8; 32],
+    own_eth_addr: &[u8; 20],
+    config: &crate::config::Config,
 ) -> anyhow::Result<(u32, Vec<u8>, u64)> {
     use tonic::metadata::MetadataValue;
     use tonic::transport::Channel;
@@ -357,6 +388,14 @@ pub async fn get_dprf_partial(
     );
 
     let resp = client.get_dprf_partial(request).await?.into_inner();
+
+    // Verify origin + integrity BEFORE decrypting: the signer must be a registered node and
+    // the signature must cover this exact ciphertext/metadata bound to us. Without this an
+    // active attacker could substitute a ciphertext we would decrypt into an attacker value.
+    let signing_msg = dprf_partial_signing_msg(own_eth_addr, resp.shard_index, resp.epoch, &resp.ciphertext);
+    verify_cluster_response(&signing_msg, &resp.signature, config)
+        .await
+        .map_err(|e| anyhow::anyhow!("partial response verification failed: {}", e))?;
 
     let partial_bytes = ecies_decrypt(own_private_key, &resp.ciphertext)
         .map_err(|e| anyhow::anyhow!("ECIES decrypt failed: {}", e))?;
@@ -444,11 +483,28 @@ pub async fn send_start_reshare(
 /// (in-group Lagrange) into the 32-byte app key for (app_id, material). The master scalar
 /// is NEVER reconstructed — this is the threshold-BLS derivation that removes the use-time
 /// single point. Peer list is read from the dynamic peer table.
+/// Which nodes actually served one derive. The coordinator is the only party that knows this —
+/// it is the one that collected the partials — and without recording it there is no way to
+/// answer "who served this request" after the fact.
+pub struct DeriveTrace {
+    /// The node that coordinated this derive — its own shard index. It is always present in
+    /// `servers` too, but that list is sorted, so without this field there is no way to tell
+    /// which of the entries did the collecting. This is what identifies the node in the log:
+    /// the same `own_id` that /peers and the dashboard's node table report, so the log needs no
+    /// separately-configured hostname to say where it came from.
+    pub coordinator: u32,
+    /// Polynomial epoch the combine ran on.
+    pub epoch: u64,
+    /// 1-based shard indices whose partial went into the combine, including this node's own.
+    /// Sorted. Its length is how much slack the derive had over `threshold`.
+    pub servers: Vec<u32>,
+}
+
 pub async fn collect_and_dprf(
     state: &AppState,
     app_id: &str,
     material: &[u8],
-) -> Result<[u8; 32], KmsError> {
+) -> Result<([u8; 32], DeriveTrace), KmsError> {
     let own = state
         .shard
         .read()
@@ -484,10 +540,15 @@ pub async fn collect_and_dprf(
     // which would feed a duplicate Lagrange identifier into the combine).
     let mut seen: std::collections::HashMap<u64, std::collections::HashSet<u32>> =
         std::collections::HashMap::new();
+    // Which shard indices actually landed in each bucket. Distinct from `seen`, which also
+    // holds indices whose payload failed to parse and therefore served nothing.
+    let mut contributors: std::collections::HashMap<u64, Vec<u32>> =
+        std::collections::HashMap::new();
     let mut ready: Option<u64> = None;
 
     seen.entry(own.epoch).or_default().insert(own.shard_index);
     buckets.entry(own.epoch).or_default().push(own_partial);
+    contributors.entry(own.epoch).or_default().push(own.shard_index);
     if buckets[&own.epoch].len() >= threshold {
         ready = Some(own.epoch);
     }
@@ -496,7 +557,16 @@ pub async fn collect_and_dprf(
     let mut peer_futures: FuturesUnordered<_> = peer_urls
         .iter()
         .map(|url| {
-            get_dprf_partial(url, app_id, material, &sig, timestamp, &state.signing_key.private_key)
+            get_dprf_partial(
+                url,
+                app_id,
+                material,
+                &sig,
+                timestamp,
+                &state.signing_key.private_key,
+                &state.signing_key.eth_address,
+                &state.config,
+            )
         })
         .collect();
 
@@ -513,20 +583,28 @@ pub async fn collect_and_dprf(
                     Ok(p) => {
                         let bucket = buckets.entry(epoch).or_default();
                         bucket.push(p);
+                        contributors.entry(epoch).or_default().push(idx);
                         if bucket.len() >= threshold {
                             ready = Some(epoch);
                         }
                     }
-                    Err(e) => tracing::warn!(shard_index = idx, epoch, error = %e, "discarding malformed partial"),
+                    Err(e) => {
+                        crate::metrics::inc(&crate::metrics::m().dprf_discarded_malformed);
+                        tracing::warn!(shard_index = idx, epoch, error = %e, "discarding malformed partial");
+                    }
                 }
             }
-            Some(Err(e)) => tracing::warn!(error = %e, "peer partial collection failed"),
+            Some(Err(e)) => {
+                crate::metrics::inc(&crate::metrics::m().dprf_discarded_peer_error);
+                tracing::warn!(error = %e, "peer partial collection failed");
+            }
             // No more peers to hear from and still short of threshold in every epoch.
             None => break,
         }
     }
 
     let epoch = ready.ok_or_else(|| {
+        crate::metrics::inc(&crate::metrics::m().dprf_short);
         let best = buckets.values().map(|b| b.len()).max().unwrap_or(0);
         KmsError::CryptoError(format!(
             "not enough valid partials in any single epoch: best {}, need {}",
@@ -546,7 +624,13 @@ pub async fn collect_and_dprf(
         .clone()
         .ok_or_else(|| KmsError::CryptoError("no group public key to verify against".into()))?;
     dprf_verify(&sigma, &group_pubkey, &msg).map_err(|e| KmsError::CryptoError(e.to_string()))?;
-    Ok(sigma_to_app_key(&sigma))
+
+    let mut servers = contributors.remove(&epoch).unwrap_or_default();
+    servers.sort_unstable();
+    Ok((
+        sigma_to_app_key(&sigma),
+        DeriveTrace { coordinator: own.shard_index, epoch, servers },
+    ))
 }
 
 // ─── Gossip background task ───────────────────────────────────────────────────
@@ -557,6 +641,12 @@ pub fn start_gossip_task(state: AppState) {
         // Short initial delay to let both HTTP and gRPC servers come up
         tokio::time::sleep(Duration::from_secs(5)).await;
         loop {
+            // Piggyback the sealed-share path probe on this loop so the /metrics scrape path
+            // stays free of filesystem I/O. A path that stopped being writable is invisible
+            // everywhere else until the next share change tries to persist and fails.
+            crate::metrics::probe_share_path(
+                crate::init::sealed_share_path(&state).as_deref(),
+            );
             gossip_round(&state).await;
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
@@ -597,11 +687,26 @@ async fn gossip_round(state: &AppState) {
 
     let self_eth_addr = hex::encode(state.signing_key.eth_address);
     let self_epoch = state.shard.read().await.as_ref().map(|s| s.epoch).unwrap_or(0);
+    let self_gpk = state.group_pubkey.read().await.clone().unwrap_or_default();
 
     for target in &targets {
-        match push_gossip(target, self_url, &self_eth_addr, self_epoch, &sig, timestamp).await {
+        match push_gossip(
+            target,
+            self_url,
+            &self_eth_addr,
+            self_epoch,
+            &self_gpk,
+            &sig,
+            timestamp,
+        )
+        .await
+        {
             Ok(received) => {
+                crate::metrics::inc(&crate::metrics::m().gossip_push_ok);
                 let now = chrono::Utc::now().timestamp();
+                crate::metrics::m()
+                    .gossip_last_success
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
                 let mut table = state.peer_table.write().await;
 
                 // Our push to `target` succeeded — DIRECT evidence that the target itself is
@@ -636,6 +741,12 @@ async fn gossip_round(state: &AppState) {
                                     // Epoch is monotonic per node; take the larger so a stale
                                     // gossip entry can't drag a peer's known epoch backwards.
                                     e.epoch = e.epoch.max(peer.epoch);
+                                    // Last non-empty value wins: a peer that has not reported
+                                    // one yet must not erase what we already learned about it,
+                                    // or a fork would flicker in and out of view.
+                                    if !peer.group_pubkey.is_empty() {
+                                        e.group_pubkey = peer.group_pubkey.clone();
+                                    }
                                 })
                                 .or_insert_with(|| {
                                     tracing::info!(peer_url = %peer.grpc_url, "gossip: discovered new peer");
@@ -646,6 +757,7 @@ async fn gossip_round(state: &AppState) {
                                         last_seen: 0,
                                         pubkey: peer.pubkey.clone(),
                                         epoch: peer.epoch,
+                                        group_pubkey: peer.group_pubkey.clone(),
                                     }
                                 });
                         }
@@ -659,16 +771,21 @@ async fn gossip_round(state: &AppState) {
                 // evicting entries — eviction was self-defeating anyway, since relayed gossip
                 // kept resurrecting dead entries.
             }
-            Err(e) => tracing::warn!(target = %target, error = %e, "gossip push failed"),
+            Err(e) => {
+                crate::metrics::inc(&crate::metrics::m().gossip_push_fail);
+                tracing::warn!(target = %target, error = %e, "gossip push failed");
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn push_gossip(
     peer_url: &str,
     self_url: &str,
     self_eth_addr: &str,
     self_epoch: u64,
+    self_group_pubkey: &[u8],
     sig: &[u8],
     timestamp: i64,
 ) -> anyhow::Result<Vec<NodeInfo>> {
@@ -691,6 +808,7 @@ async fn push_gossip(
             eth_addr: self_eth_addr.to_string(),
             pubkey: Vec::new(),
             epoch: self_epoch,
+            group_pubkey: self_group_pubkey.to_vec(),
         }),
     });
     request.metadata_mut().insert(

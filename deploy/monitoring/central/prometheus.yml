@@ -1,0 +1,29 @@
+global:
+  # Matched to the KMS gossip period. Scraping faster adds no information: the cluster-view
+  # gauges only change when gossip refreshes them.
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: kms
+    metrics_path: /metrics
+    static_configs:
+      # One entry per KMS node — its external IP (or host reachable by this central machine) on
+      # port 9090. The `node` label is what every dashboard and alert joins on; keep it stable
+      # across IP changes, which do happen when a CVM is rebuilt.
+      #
+      # VERIFY THIS LIST against the on-chain nodeList before relying on it. A node that is
+      # registered but missing here is invisible, and invisible reads as healthy.
+      - targets: ["<NODE_1_IP>:9090"]
+        labels: {node: kms-node1}
+      - targets: ["<NODE_2_IP>:9090"]
+        labels: {node: kms-node2}
+      - targets: ["<NODE_3_IP>:9090"]
+        labels: {node: kms-node3}
+      - targets: ["<NODE_4_IP>:9090"]
+        labels: {node: kms-node4}
+      - targets: ["<NODE_5_IP>:9090"]
+        labels: {node: kms-node5}

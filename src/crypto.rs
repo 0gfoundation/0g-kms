@@ -204,15 +204,14 @@ pub fn ecies_decrypt(private_key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8
 
 // ─── Signing ──────────────────────────────────────────────────────────────────
 
-/// Sign a gRPC request message with a secp256k1 private key.
-/// Returns a recoverable signature (65 bytes: r || s || v).
-/// Signed message: "kms:{method}:{timestamp}"
-pub fn sign_request(private_key: &[u8; 32], method: &str, timestamp: i64) -> Result<Vec<u8>> {
+/// Sign an arbitrary message with a secp256k1 private key (keccak256 prehash).
+/// Returns a recoverable signature (65 bytes: r || s || v), so the verifier can recover
+/// the signer's address and check it against the on-chain nodeList.
+pub fn sign_bytes(private_key: &[u8; 32], message: &[u8]) -> Result<Vec<u8>> {
     use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, SigningKey};
     use sha3::{Digest, Keccak256};
 
-    let message = format!("kms:{}:{}", method, timestamp);
-    let hash = Keccak256::digest(message.as_bytes());
+    let hash = Keccak256::digest(message);
 
     let signing_key = SigningKey::from_bytes(private_key.into())
         .map_err(|e| anyhow!("invalid signing key: {}", e))?;
@@ -223,6 +222,61 @@ pub fn sign_request(private_key: &[u8; 32], method: &str, timestamp: i64) -> Res
     let mut bytes = sig.to_bytes().to_vec(); // 64 bytes: r || s
     bytes.push(recovery_id.to_byte());       // + v
     Ok(bytes)
+}
+
+/// Sign a gRPC request message with a secp256k1 private key.
+/// Returns a recoverable signature (65 bytes: r || s || v).
+/// Signed message: "kms:{method}:{timestamp}"
+pub fn sign_request(private_key: &[u8; 32], method: &str, timestamp: i64) -> Result<Vec<u8>> {
+    sign_bytes(private_key, format!("kms:{}:{}", method, timestamp).as_bytes())
+}
+
+// ─── ECIES response authentication ──────────────────────────────────────────────
+//
+// ECIES protects confidentiality only: the target is the caller's *public* key, so anyone
+// can produce a ciphertext the caller decrypts successfully. An active attacker on the wire
+// can therefore substitute a ciphertext of their choosing and the caller would use an
+// attacker-chosen partial/shard. To close this, the responder signs the ciphertext (plus its
+// metadata, bound to the specific caller) with its node key; the caller verifies the recovered
+// signer is an on-chain node before decrypting. The binding to `caller_addr` stops a response
+// meant for one node being replayed to another; the domain tag + metadata stop cross-method
+// reuse and metadata rewriting.
+
+/// Domain-separated message a cluster ECIES response is signed over. Only the trailing
+/// `ciphertext` is variable-length; every preceding field is fixed-size or delimited, so the
+/// concatenation is unambiguous.
+fn ecies_response_msg(method: &str, caller_addr: &[u8; 20], meta: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(9 + method.len() + 1 + 20 + meta.len() + ciphertext.len());
+    m.extend_from_slice(b"kms-resp:");
+    m.extend_from_slice(method.as_bytes());
+    m.push(b':');
+    m.extend_from_slice(caller_addr);
+    m.extend_from_slice(meta);
+    m.extend_from_slice(ciphertext);
+    m
+}
+
+/// Message signed over a GetDprfPartial response (binds shard_index + epoch + ciphertext).
+pub fn dprf_partial_signing_msg(
+    caller_addr: &[u8; 20],
+    shard_index: u32,
+    epoch: u64,
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let mut meta = shard_index.to_be_bytes().to_vec();
+    meta.extend_from_slice(&epoch.to_be_bytes());
+    ecies_response_msg("GetDprfPartial", caller_addr, &meta, ciphertext)
+}
+
+/// Message signed over a shard response (RequestShard / GetShardContribution). `method`
+/// distinguishes the two RPCs so a response to one cannot be replayed as the other.
+pub fn shard_signing_msg(
+    method: &str,
+    caller_addr: &[u8; 20],
+    shard_index: u32,
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    ecies_response_msg(method, caller_addr, &shard_index.to_be_bytes(), ciphertext)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -351,6 +405,37 @@ mod tests {
         let privkey: [u8; 32] = signing_key.to_bytes().into();
         let sig = sign_request(&privkey, "GetShardContribution", 1234567890).unwrap();
         assert_eq!(sig.len(), 65);
+    }
+
+    #[test]
+    fn ecies_response_signature_binds_ciphertext_and_caller() {
+        use crate::auth::{eth_address_from_pubkey, recover_signer_address};
+
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let privkey: [u8; 32] = signing_key.to_bytes().into();
+        let signer = eth_address_from_pubkey(&pubkey_from_private(&privkey).unwrap());
+
+        let caller = [0x11u8; 20];
+        let ct = b"ecies-ciphertext-bytes".to_vec();
+        let msg = dprf_partial_signing_msg(&caller, 3, 5, &ct);
+        let sig = sign_bytes(&privkey, &msg).unwrap();
+        assert_eq!(sig.len(), 65);
+
+        // Honest path: the signer recovered from the exact signed message is our node.
+        assert_eq!(recover_signer_address(&msg, &sig).unwrap(), signer);
+
+        // A swapped ciphertext changes the message, so the recovered signer is no longer us —
+        // verification against the nodeList would reject it.
+        let tampered = dprf_partial_signing_msg(&caller, 3, 5, b"attacker-ciphertext");
+        assert_ne!(recover_signer_address(&tampered, &sig).unwrap(), signer);
+
+        // Rewritten metadata (epoch) likewise breaks the binding.
+        let wrong_epoch = dprf_partial_signing_msg(&caller, 3, 6, &ct);
+        assert_ne!(recover_signer_address(&wrong_epoch, &sig).unwrap(), signer);
+
+        // Replaying our response to a different caller fails to recover us.
+        let other_caller = dprf_partial_signing_msg(&[0x22u8; 20], 3, 5, &ct);
+        assert_ne!(recover_signer_address(&other_caller, &sig).unwrap(), signer);
     }
 }
 

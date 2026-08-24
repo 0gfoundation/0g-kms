@@ -39,6 +39,7 @@ Each node signs the derivation message with its own share locally; the coordinat
 | `proto/kms_cluster.proto` | inter-node protocol (DPRF partials, gossip, DKG rounds, reshare) |
 | `docs/CLUSTER.md` | lifecycle & API guide: init / join / rejoin / derive / auth / refresh |
 | `docs/TESTNET_E2E.md` | real-TEE + testnet end-to-end runbook (deploy, node replacement, …) |
+| `deploy/` | deployment templates: per-node compose (kms + TLS + log shipping) and the central monitoring host |
 | `test/local-cluster/` | self-contained 3-node e2e harness (mock chain + mock TEE, builds from source) |
 | `examples/dprf_client.rs` | reference `/app-key` client (EIP-191 sign + ECIES decrypt) |
 | `vendor/uint-zigzag` | in-tree std-only fork un-rotting a yanked transitive dep (`core2`) |
@@ -61,38 +62,37 @@ See `test/local-cluster/README.md` for the full scenario list (threshold, recove
 ### Production (real TEE + on-chain registry)
 
 One node per host, deployed as a tapp. Build & push the image (`Dockerfile`; needs `protoc` if
-building natively), give each host its own `kms.toml`, register the nodes in TappRegistry, and
-start via tapp-cli — the nodes discover each other, wait for the full nodeList, and run genesis
-together. Full runbook: `docs/TESTNET_E2E.md`; lifecycle reference: `docs/CLUSTER.md`.
+building natively), give each host its own config, register the nodes in TappRegistry, and start
+via tapp-cli — the nodes discover each other, wait for the full nodeList, and run genesis
+together.
 
-## Configuration (`kms.toml`)
+Ready-to-fill templates for the whole stack (node compose, TLS, log shipping, and the central
+Prometheus/Loki/Grafana host) are in **[`deploy/`](deploy/)**. Full runbook:
+`docs/TESTNET_E2E.md`; lifecycle reference: `docs/CLUSTER.md`.
+
+## Configuration
+
+Each node gets its own config file. Start from **[`deploy/kms.toml.example`](deploy/kms.toml.example)**
+— it is the single source of truth for the field set, so it cannot drift from a second copy pasted
+into this README.
+
+Only three fields differ between nodes: `self_url`, `seeds`, and (per environment) `app_id`.
 
 ```toml
-[server]
-bind      = "0.0.0.0:9090"   # HTTP: /app-key /refresh /peers /sealed-share
-grpc_bind = "0.0.0.0:9092"   # inter-node gRPC
-
-[tapp]
-app_id     = "my-kms"        # KMS's own app_id in TappRegistry
-tapp_ip    = "host.docker.internal"
-tapp_port  = 50051
-# tapp_socket = "/run/tapp/tapp.sock"   # optional Unix-socket to the local tapp-server
-# mock_tee = true              # dev/CI only: key from MOCK_APP_PRIVATE_KEY env
-
-[chain]
-rpc_url          = "https://evmrpc-testnet.0g.ai"
-contract_address = "0x…"       # TappRegistry
-
 [cluster]
 threshold   = 2
-total_nodes = 4
+total_nodes = 5
 self_url    = "http://<this-node-ip>:9092"   # how peers reach THIS node
-seeds       = ["http://<peer-ip>:9092", …]   # bootstrap contacts (list several)
-# sealed_share      = "<base64url>"      # reload this share at boot (omit = fresh start)
-# sealed_share_path = "/data/share.seal" # auto-persist target (needs a durable volume)
+seeds       = ["http://<peer-ip>:9092", …]   # MESH — list every other peer, not just one
+sealed_share_path = "/var/lib/kms/share.sealed"   # durable volume; enables restart without rejoin
 ```
 
-`KMS_SEALED_SHARE` / `KMS_SEALED_SHARE_PATH` env vars override the two sealed-share fields.
+`seeds` must list **every** other peer. A restarted node asks `seeds` for its share; if that list
+held only one node and that node were down, it would see "no seed reachable" and wrongly start a
+fresh genesis.
+
+`KMS_SEALED_SHARE` / `KMS_SEALED_SHARE_PATH` override the two sealed-share fields.
+`KMS_LOG_FORMAT=json` and `KMS_LOG_DIR=<dir>` control logging — see Monitoring below.
 
 ## HTTP API
 
@@ -100,8 +100,111 @@ seeds       = ["http://<peer-ip>:9092", …]   # bootstrap contacts (list severa
 |---|---|---|
 | `POST /app-key` | EIP-191 by a signer of the **requested** `app_id` | derive; response ECIES-encrypted to the caller |
 | `POST /refresh` | EIP-191 by the **app owner** (`Refresh:{ts}`) | proactive share rotation (needs all members healthy, single epoch) |
-| `GET /peers` | — | liveness/epoch view, `cluster_epoch`, `live_share_holders` |
+| `GET /peers` | — | cluster view: `cluster_epoch`, `own_id`, `group_pubkey`, `leading_holders`, `recovery_threshold` |
 | `GET /sealed-share` | — | latest sealed blob (ciphertext; for restart re-injection) |
+| `GET /health` | — | liveness — the process is serving. Says nothing about cluster state |
+| `GET /ready` | — | 200 only when this node holds a share and knows the group pubkey; 503 otherwise |
+| `GET /metrics` | — | Prometheus text exposition (see below) |
+
+## Monitoring
+
+`/metrics` is dependency-free Prometheus text on the same port as the rest of the API. No key
+material, nothing labelled by app or caller.
+
+The number to alert on is **`kms_leading_holders < kms_recovery_threshold`**, where
+`recovery_threshold = max(threshold, ⌊n/2⌋)`. Below that line a shardless node can no longer
+rejoin — `run_reshare_recovery` needs `threshold` dealers *and* a committee majority — while
+derives keep succeeding and every other signal stays green. `kms_threshold` is a whole tier
+later: by the time holders reach it, the master is one node away from being lost for good.
+
+`leading_holders` counts live holders **on the leading epoch**, which is what a reshare can
+actually draw dealers from. `live_share_holders` counts holders on any epoch and will read
+higher whenever someone is stranded behind — useful context, wrong alerting line.
+
+Other signals worth a rule:
+
+| Metric | Why |
+|---|---|
+| `count(count by (hash) (kms_group_pubkey_info)) > 1` | more than one master across the fleet — the cluster forked |
+| `kms_master_matches_baseline == 0` | this node's master changed since it first formed (fork, or an uncleaned re-genesis) |
+| `kms_last_recovery_seconds` trending up | single-node recovery time is degrading — the committee's whole margin is spent in units of it (I8) |
+| `kms_shardless_seconds` climbing | recovery is not converging — the incident-review lesson is that this number, not "is the node up", is what runs away |
+| `kms_epoch_lag > 0` sustained | stranded on a stale polynomial, silently not contributing to derives |
+| `kms_sealed_persist_failures_total > 0` | harmless now, fatal on the next restart (rejoin instead of reload) |
+| `kms_share_path_writable == 0` | the durable path stopped accepting writes; a read-only remount looks healthy everywhere else |
+| `kms_dprf_partials_last == kms_threshold` | derives have no spare holder left |
+| `kms_chain_stale_served_total` climbing | authorization is running on a nodeList that is no longer refreshing |
+| `kms_appkey_requests_total{result="bad_request"}` rising | a *client* is sending malformed input — the KMS is rejecting it correctly with 400; excluded from the error-rate alert on purpose |
+
+### Judging the master
+
+Two independent checks, deliberately not relying on any node's own opinion:
+
+**Across the fleet** — `kms_group_pubkey_info` carries the master as a *label*, so a fork is a
+count of distinct values:
+
+```promql
+count(count by (hash) (kms_group_pubkey_info))   # 1 = one master, >1 = forked
+```
+
+A node on the wrong side of a fork reports its wrong hash as confidently as the rest report the
+right one, which is exactly what makes counting work. Cardinality is safe: reshare and refresh
+preserve the master, so a second value only appears when something is genuinely wrong.
+(`kms_group_pubkey_mismatch` is the node's *own* comparison over gossip — useful context, but it
+says a fork exists, not who is right.)
+
+**Against history** — on first formation each node records its master to `master.baseline`, next
+to the sealed share, and checks against it on every later formation. Written once and never
+overwritten automatically: a version that re-recorded the master whenever it changed would agree
+with itself forever and detect nothing. Changing it means a human deleting the file.
+
+The baseline is plaintext (it is a public key) and independent of the sealed share on purpose.
+After a TEE identity change the sealed share can no longer be opened, so the node rejoins with no
+memory at all and will accept whatever master the committee hands it — the baseline is the only
+anchor that survives exactly the event that destroys every other one.
+
+Two limits are worth stating plainly, because both are easy to assume away:
+
+**It anchors, it does not validate.** The first formation after upgrading writes whatever master
+that node is holding, and treats it as truth from then on. If a node were already on the wrong
+side of a fork at that moment, it would record the wrong value and agree with itself forever
+after. So the fleet must be verified consistent *before* the first node records a baseline —
+that is the one moment where a human still has to look:
+
+```bash
+# every node must print the same value
+tapp-cli --server http://<node>:50051 get-app-logs --app-id <app> --service kms -n 500 \
+  | grep -o 'group_pubkey=[0-9a-f]*' | tail -1
+```
+
+Once every node is upgraded the fleet-wide count above takes over and this is no longer manual.
+
+**It dies with the volume.** The baseline lives on the same durable path as the sealed share, so
+losing that disk loses both: the node rejoins with no memory and records the master it is handed.
+It protects the case where the disk survives but the TEE identity does not (a VM restart) — which
+is the common one — and nothing beyond that. Fleet-wide counting is what covers the rest.
+
+### Per-request service log
+
+Every derive is logged, successful or not, with `result` distinguishing them:
+
+```
+app-key issued   result=ok           app_id=… coordinator=3 epoch=9 servers=1,3 duration_ms=8
+app-key failed   result=bad_request  app_id=… error="bad request: invalid material hex"
+```
+
+`coordinator` is the node that collected the partials — the same `own_id` that `/peers` and the
+node table report. It is in the line rather than a log label so the collector needs no per-host
+configuration to say where a record came from.
+
+Failures are logged too, and that is not decorative: the metrics can narrow an incident down to
+"not the cluster", but only the log says *which field* was malformed. `KMS_LOG_FORMAT=json` makes
+these fields machine-parseable; `KMS_LOG_DIR` additionally writes daily-rotating files (7 kept,
+capped in code) so a shipper can read them from a shared volume instead of being handed the
+host's docker socket.
+
+This stays a log rather than a metric: one series per request would blow up cardinality, and the
+caller identity is kept out of `/metrics` labels, where it would be world-readable.
 
 ## Operational invariants
 
@@ -110,7 +213,9 @@ seeds       = ["http://<peer-ip>:9092", …]   # bootstrap contacts (list severa
 - **Restart shardless nodes one at a time** (wait for `reshare recovery complete`) — concurrent
   rejoins are the one accepted-risk gap (#6).
 - **Refresh only when everyone is healthy** — it is proactive and can wait.
-- **On a re-genesis** (new master — deliberate, destructive): omit/clear all sealed-share blobs.
+- **On a re-genesis** (new master — deliberate, destructive): omit/clear all sealed-share blobs
+  **and delete `master.baseline`** on every node. A re-genesis legitimately mints a new master;
+  leaving the old baseline in place makes every node report `kms_master_matches_baseline 0`.
 
 ## Status / known limitations
 

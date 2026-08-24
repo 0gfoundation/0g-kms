@@ -1,0 +1,952 @@
+{
+  "uid": "kms-cluster",
+  "title": "KMS Cluster",
+  "description": "One view for the whole cluster. Node detail is a table, not five dashboards — an operator should never have to aggregate across tabs by hand, because that is the step that gets it wrong.",
+  "tags": [
+    "kms"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Cluster",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": [],
+      "id": 1
+    },
+    {
+      "type": "stat",
+      "title": "Healthy nodes",
+      "description": "Live share-holders on the LEADING epoch — the population a reshare can draw dealers from. A holder stranded on an older epoch cannot deal, so it is not counted here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(kms_leading_holders)",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 3
+              },
+              {
+                "color": "green",
+                "value": 4
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "background",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "id": 2
+    },
+    {
+      "type": "stat",
+      "title": "Recovery threshold",
+      "description": "max(threshold, floor(n/2)). Below this a shardless node can no longer rejoin, while derives carry on looking perfectly healthy. This is the line to watch, not the service threshold.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(kms_recovery_threshold)",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "none",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "id": 3
+    },
+    {
+      "type": "stat",
+      "title": "Service threshold",
+      "description": "Partials needed to derive at all. Reaching this means the master is one node away from being unrecoverable — a whole tier past the recovery threshold.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(kms_threshold)",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "none",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "id": 4
+    },
+    {
+      "type": "stat",
+      "title": "Committee size",
+      "description": "Configured n. Compare against the number of rows in the node table below — a node registered on-chain but missing from the scrape list is invisible, and invisible reads as healthy.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(kms_total_nodes)",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "none",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "id": 5
+    },
+    {
+      "type": "stat",
+      "title": "Derive success rate",
+      "description": "Excludes unauthorized and bad_request from the denominator — both are the caller's problem, and a client shipping malformed input must not read as the service degrading. No traffic shows as No data rather than 0%: 0/0 is NaN in PromQL, which is the honest answer. Guarding the divisor instead would paint an idle cluster bright red.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(kms_appkey_requests_total{result=\"ok\"}[10m])) / sum(rate(kms_appkey_requests_total{result!~\"unauthorized|bad_request\"}[10m]))",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.95
+              },
+              {
+                "color": "green",
+                "value": 0.99
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "no traffic",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "background",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "id": 6
+    },
+    {
+      "type": "stat",
+      "title": "Master",
+      "description": "Distinct group public keys across the fleet. Counted from the outside rather than trusted from any node: on a fork each side reports its own master with equal confidence, which is exactly what makes counting work.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(count by (hash) (kms_group_pubkey_info))",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "UNIQUE",
+                  "color": "green",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": 2,
+                "to": 999,
+                "result": {
+                  "text": "FORKED",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "background",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "id": 7
+    },
+    {
+      "type": "row",
+      "title": "Service record — which nodes served each derive",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "collapsed": false,
+      "panels": [],
+      "id": 8
+    },
+    {
+      "type": "logs",
+      "title": "Derives",
+      "description": "One line per successful derive: app_id, caller, epoch, the shard indices whose partials were combined, and duration. The coordinating node is the only party that knows the server set, so this log is the only place the answer exists after the fact.",
+      "datasource": {
+        "type": "loki",
+        "uid": "kms-loki"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{job=\"kms\"} |~ \"app-key (issued|failed)\" | json",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "id": 9
+    },
+    {
+      "type": "timeseries",
+      "title": "Derive rate by outcome",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(kms_appkey_requests_total[5m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "id": 10
+    },
+    {
+      "type": "timeseries",
+      "title": "Partials dropped during collection",
+      "description": "Peers that were unreachable or returned an unparseable partial. Derives still succeed while enough healthy holders remain, so this rising is the warning that precedes failure. (There is no 'partials per derive' panel on purpose: collection stops as soon as one epoch reaches threshold, so that number is always exactly threshold.)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(kms_dprf_discarded_total[10m]))",
+          "legendFormat": "{{reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(kms_dprf_short_total[10m]))",
+          "legendFormat": "derive short of threshold"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "id": 11
+    },
+    {
+      "type": "row",
+      "title": "Nodes",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "collapsed": false,
+      "panels": [],
+      "id": 12
+    },
+    {
+      "type": "table",
+      "title": "Node detail",
+      "description": "own_id is the node's position in the on-chain nodeList and doubles as its shard index. Across the cluster these must be 1..n with no gaps or repeats — a reordered nodeList shows up here first, and that reorder is what forks the master.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "targets": [
+        {
+          "refId": "id",
+          "expr": "kms_own_id",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "epoch",
+          "expr": "kms_epoch",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "share",
+          "expr": "kms_has_share",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "lag",
+          "expr": "kms_epoch_lag",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "shardless",
+          "expr": "kms_shardless_seconds",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "recovery",
+          "expr": "kms_last_recovery_seconds",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "baseline",
+          "expr": "kms_master_matches_baseline",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "writable",
+          "expr": "kms_share_path_writable",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "peers",
+          "expr": "kms_peers_live",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "gossip",
+          "expr": "kms_gossip_last_success_age_seconds",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "up",
+          "expr": "up{job=\"kms\"}",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "pattern": "^(node|Value.*|kms_.*|up)$"
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "node",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "renameByName": {
+              "Value #id": "own_id",
+              "kms_own_id": "own_id",
+              "Value #epoch": "epoch",
+              "kms_epoch": "epoch",
+              "Value #share": "has share",
+              "kms_has_share": "has share",
+              "Value #lag": "epoch lag",
+              "kms_epoch_lag": "epoch lag",
+              "Value #shardless": "shardless",
+              "kms_shardless_seconds": "shardless",
+              "Value #recovery": "last recovery",
+              "kms_last_recovery_seconds": "last recovery",
+              "Value #baseline": "baseline",
+              "kms_master_matches_baseline": "baseline",
+              "Value #writable": "path writable",
+              "kms_share_path_writable": "path writable",
+              "Value #peers": "live peers",
+              "kms_peers_live": "live peers",
+              "Value #gossip": "gossip age",
+              "kms_gossip_last_success_age_seconds": "gossip age",
+              "Value #up": "scrape",
+              "up{job=\"kms\"}": "scrape"
+            },
+            "indexByName": {}
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "scrape"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "up",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "DOWN",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "has share"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "yes",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "NO",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "baseline"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "ok",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "CHANGED",
+                        "color": "red",
+                        "index": 1
+                      },
+                      "-1": {
+                        "text": "none",
+                        "color": "text",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "path writable"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "yes",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "READ-ONLY",
+                        "color": "red",
+                        "index": 1
+                      },
+                      "-1": {
+                        "text": "n/a",
+                        "color": "text",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "epoch lag"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shardless"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 1
+                    },
+                    {
+                      "color": "red",
+                      "value": 1800
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "last recovery"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gossip age"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 120
+                    },
+                    {
+                      "color": "red",
+                      "value": 300
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "node",
+            "desc": false
+          }
+        ]
+      },
+      "id": 13
+    },
+    {
+      "type": "timeseries",
+      "title": "Time without a share, per node",
+      "description": "The single-node recovery time. The committee's whole fault tolerance is spent in units of this number — the 2026-08-04 incident was this value going to infinity on three nodes at once, not the nodes going down.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kms-prom"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "kms_shardless_seconds",
+          "legendFormat": "{{node}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "id": 14
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}
