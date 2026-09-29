@@ -106,6 +106,25 @@ fresh genesis.
 | `GET /ready` | — | 200 only when this node holds a share and knows the group pubkey; 503 otherwise |
 | `GET /metrics` | — | Prometheus text exposition (see below) |
 
+## Attested admission
+
+With a `[verifier]` section configured (see `deploy/kms.toml.example`), both admission paths —
+`POST /app-key` callers and inter-node gRPC peers — require, on top of on-chain membership, that
+tappscan has verified the signer's TEE evidence. The on-chain nodeList proves only that the
+*owner* endorsed an address (the contract never sees a quote); this gate is what makes "genuine
+TEE running the declared code" enforced rather than merely audited. Unconfigured = exactly the
+old behaviour.
+
+The KMS pins scan's **attested TLS key** from config — no CA involved — and consumes verdicts
+over that channel. Verdicts are cached per (app_id, signer); signer keys rotate with the host's
+tapp-server, so cache generations track identity generations for free. Failure is closed *for
+the increment only*: a verified signer keeps working from cache while scan is down, an unseen
+signer is refused. Denials return 403 and are counted as `result="not_attested"`.
+
+Scan itself is never vouched for by its own verdicts: verifying scan is a public, human-
+reproducible act (reference values live in the 0g-tapp-verifier repo), and the pin is its
+output. Design: 0g-kms#14; scan-side counterpart: 0g-tapp-verifier#14.
+
 ## Monitoring
 
 `/metrics` is dependency-free Prometheus text on the same port as the rest of the API. No key

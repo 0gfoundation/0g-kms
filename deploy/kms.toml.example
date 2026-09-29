@@ -28,3 +28,13 @@ seeds = [
   "http://<PEER_3_INTERNAL_IP>:9092",
   "http://<PEER_4_INTERNAL_IP>:9092",
 ]
+
+# Attested admission (0g-kms#14). Optional — absent means admission is on-chain membership
+# only. Enable once tappscan serves its attested TLS key (0g-tapp-verifier#14).
+# [verifier]
+# url     = "https://<SCAN_HOST>"
+# # scan's attested TLS pubkey(s) — the tls_public_key its evidence carries. The pin IS the
+# # authenticity story (no CA). A set, so a scan identity rotation can roll without a flag day.
+# pubkeys = ["<SCAN_ATTESTED_TLS_PUBKEY_HEX>"]
+# # QoS tier only, not a security boundary — plaintext here is fine.
+# api_key = "<SCAN_API_KEY>"

@@ -58,6 +58,13 @@ pub async fn authenticate(
         .await
         .map_err(|e| Status::unauthenticated(format!("on-chain verification failed: {}", e)))?;
 
+    // 4. Attested admission (issue #14): the nodeList proves owner endorsement only. This is
+    //    the committee-side gate — the one that stops a stolen owner key from registering a
+    //    non-TEE "node" and collecting a share via rejoin. No-op until [verifier] is configured.
+    crate::verifier::require_verified(&config.tapp.app_id, &caller_eth_addr)
+        .await
+        .map_err(|reason| Status::permission_denied(format!("attestation gate: {}", reason)))?;
+
     Ok(AuthContext { caller_pubkey, caller_eth_addr })
 }
 

@@ -203,6 +203,8 @@ pub async fn handle_app_key(
         | Err(KmsError::InvalidSignature(_))
         | Err(KmsError::AppNotFound(_)) => (&mt.appkey_unauthorized, "unauthorized"),
         Err(KmsError::BadRequest(_)) => (&mt.appkey_bad_request, "bad_request"),
+        // The caller's problem, like unauthorized: signature fine, identity unattested.
+        Err(KmsError::NotAttested(_)) => (&mt.appkey_unauthorized, "not_attested"),
         Err(KmsError::ConfigError(_)) => (&mt.appkey_not_ready, "not_ready"),
         Err(_) => (&mt.appkey_error, "error"),
     };
@@ -275,6 +277,13 @@ async fn app_key_inner(
             recovered_addr, req.app_id
         )));
     }
+
+    // 2b. Attested admission (issue #14): being in the owner-written on-chain list is
+    //     endorsement, not proof of TEE — require a verified-evidence verdict for this signer.
+    //     No-op until [verifier] is configured.
+    crate::verifier::require_verified(&req.app_id, &recovered_addr)
+        .await
+        .map_err(KmsError::NotAttested)?;
 
     // 3. Threshold-BLS DPRF: collect partials from ≥ threshold nodes and combine them into
     //    the app key, bound to (app_id, material). The master is never reconstructed.
