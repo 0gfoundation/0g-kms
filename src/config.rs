@@ -7,6 +7,8 @@ pub struct Config {
     pub tapp: TappConfig,
     pub chain: ChainConfig,
     pub cluster: ClusterConfig,
+    #[serde(default)]
+    pub verifier: Option<VerifierConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +51,29 @@ impl TappConfig {
     pub fn tapp_url(&self) -> String {
         format!("http://{}:{}", self.tapp_ip, self.tapp_port)
     }
+}
+
+/// The tappscan verifier this node believes about TEE evidence (issue #14). Optional: absent
+/// means admission is chain-membership only, exactly as before — the gate ships dark and turns
+/// on with a config change once scan serves its attested TLS key (0g-tapp-verifier#14).
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifierConfig {
+    /// Base URL, e.g. "https://scan.example". Plain http is refused unless `insecure_http`.
+    pub url: String,
+    /// Pinned attested TLS keys: hex of **sha256 over the SubjectPublicKeyInfo DER** (32 bytes
+    /// each) — the curl `--pinnedpubkey` convention, and exactly the `tls_public_key` value
+    /// scan's evidence carries / its API publishes. NOT the raw key bits. A set, so a scan
+    /// identity rotation can be rolled without a flag day. The pin — not any CA — is the whole
+    /// authenticity story.
+    #[serde(default)]
+    pub pubkeys: Vec<String>,
+    /// API key for scan's higher rate-limit tier. QoS only, NOT a security boundary — a stolen
+    /// key wins quota, nothing else — which is why it may sit in plaintext config.
+    #[serde(default)]
+    pub api_key: String,
+    /// Allow a plain-http verifier URL. Disables pinning entirely; local tests only.
+    #[serde(default)]
+    pub insecure_http: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

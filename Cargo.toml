@@ -82,9 +82,20 @@ tracing-appender = "0.2"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# Attested-admission verifier client (issue #14): HTTPS to tappscan with the server key PINNED
+# (RA-TLS style — we trust the exact attested key from config, not any CA). reqwest carries the
+# request; rustls hosts the custom pin verifier; x509-parser extracts the SPKI key to compare.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# default-features would pull aws-lc-rs (and its cmake build) into the TEE-measured image while
+# the code instantiates the ring provider — dead weight in the measured surface (PR #15 review).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+x509-parser = "0.16"
+
 [dev-dependencies]
 wiremock = "0.6"
 tokio-test = "0.4"
+# verifier pin unit tests: generate throwaway self-signed certs to check the SPKI pinning.
+rcgen = "0.13"
 # `examples/dprf_client.rs` only (test tooling). Not compiled into the release binary,
 # so it has zero impact on the production image (`cargo build --release --bin kms-server`).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

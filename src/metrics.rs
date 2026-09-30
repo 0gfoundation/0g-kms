@@ -91,6 +91,20 @@ pub struct Metrics {
     pub last_recovery_seconds: AtomicU64,
 
     // ── Gossip and chain ──────────────────────────────────────────────────────
+    // ── Attested-admission verifier (issue #14) ───────────────────────────────
+    /// 1 = a [verifier] is configured and gating admission, 0 = feature dark.
+    pub verifier_enabled: AtomicI64,
+    /// Signers admitted (fresh verdict or cache).
+    pub verifier_allowed: AtomicU64,
+    /// Signers refused on an explicit negative verdict.
+    pub verifier_denied: AtomicU64,
+    /// Scan unreachable during a check, but a stale positive existed — served from cache.
+    /// An availability win: traffic continued. Informational.
+    pub verifier_stale_served: AtomicU64,
+    /// Scan unreachable and the signer had no (fresh-enough) positive — refused, fail-closed.
+    /// Actionable: new onboarding is blocked until scan answers.
+    pub verifier_unavailable_refused: AtomicU64,
+
     pub gossip_push_ok: AtomicU64,
     pub gossip_push_fail: AtomicU64,
     /// Unix seconds of the last gossip push that succeeded against any peer. 0 = never.
@@ -130,6 +144,11 @@ impl Metrics {
             share_path_writable: AtomicI64::new(-1),
             master_matches_baseline: AtomicI64::new(-1),
             last_recovery_seconds: AtomicU64::new(0),
+            verifier_enabled: AtomicI64::new(0),
+            verifier_allowed: AtomicU64::new(0),
+            verifier_denied: AtomicU64::new(0),
+            verifier_stale_served: AtomicU64::new(0),
+            verifier_unavailable_refused: AtomicU64::new(0),
             gossip_push_ok: AtomicU64::new(0),
             gossip_push_fail: AtomicU64::new(0),
             gossip_last_success: AtomicI64::new(0),
@@ -710,6 +729,28 @@ pub async fn render(state: &AppState) -> String {
     );
 
     // ── Gossip and chain ──────────────────────────────────────────────────────
+    // ── Attested-admission verifier ───────────────────────────────────────────
+    g!(
+        "kms_verifier_enabled",
+        "1 = attested-admission gate active ([verifier] configured), 0 = admission is on-chain \
+         membership only. The fleet must be uniformly 1 or 0 — a mixed fleet gates inconsistently.",
+        "gauge",
+        m.verifier_enabled.load(Relaxed).to_string(),
+    );
+    let _ = write!(
+        o,
+        "# HELP kms_verifier_total Attested-admission checks by outcome.\n\
+         # TYPE kms_verifier_total counter\n\
+         kms_verifier_total{{result=\"allowed\"}} {}\n\
+         kms_verifier_total{{result=\"denied\"}} {}\n\
+         kms_verifier_total{{result=\"unavailable_served_stale\"}} {}\n\
+         kms_verifier_total{{result=\"unavailable_refused\"}} {}\n",
+        m.verifier_allowed.load(Relaxed),
+        m.verifier_denied.load(Relaxed),
+        m.verifier_stale_served.load(Relaxed),
+        m.verifier_unavailable_refused.load(Relaxed),
+    );
+
     let _ = write!(
         o,
         "# HELP kms_gossip_push_total Outbound gossip pushes by outcome.\n\

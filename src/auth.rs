@@ -58,6 +58,13 @@ pub async fn authenticate(
         .await
         .map_err(|e| Status::unauthenticated(format!("on-chain verification failed: {}", e)))?;
 
+    // 4. Attested admission (issue #14): the nodeList proves owner endorsement only. This is
+    //    the committee-side gate — the one that stops a stolen owner key from registering a
+    //    non-TEE "node" and collecting a share via rejoin. No-op until [verifier] is configured.
+    crate::verifier::require_verified(&config.tapp.app_id, &caller_eth_addr)
+        .await
+        .map_err(|reason| Status::permission_denied(format!("attestation gate: {}", reason)))?;
+
     Ok(AuthContext { caller_pubkey, caller_eth_addr })
 }
 
@@ -132,6 +139,12 @@ pub async fn verify_cluster_response(message: &[u8], sig_bytes: &[u8], config: &
     if !nodes.contains(&signer) {
         return Err(anyhow!("response signer {:?} is not a registered node", signer));
     }
+    // Attested admission, outbound direction (PR #15 review finding 2): without this, the same
+    // rogue nodeList entry the inbound gates refuse could still *serve* responses — configured
+    // as a seed, it could hand a rejoining node an attacker-chosen share. Cached, so ~free.
+    crate::verifier::require_verified(&config.tapp.app_id, &signer)
+        .await
+        .map_err(|reason| anyhow!("response signer failed attestation gate: {}", reason))?;
     Ok(())
 }
 
