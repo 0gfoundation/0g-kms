@@ -116,11 +116,17 @@ TEE running the declared code" enforced rather than merely audited. Unconfigured
 old behaviour.
 
 The KMS pins scan's **attested TLS key** from config — no CA involved — and consumes verdicts
-over that channel. Verdicts are cached per (app_id, signer); signer keys rotate with the host's
+over that channel. The pinned value is the sha256 of the SPKI DER (curl `--pinnedpubkey`
+convention), which is exactly the `tls_public_key` scan's evidence carries; boot refuses any
+other length, because a raw EC point pasted there would otherwise fail every handshake in a way
+indistinguishable from a scan outage. Verdicts are cached per (app_id, signer); signer keys rotate with the host's
 tapp-server, so cache generations track identity generations for free. Failure is closed *for
 the increment only*: a verified signer keeps working from cache while scan is down, an unseen
 signer is refused. Denials return 403; the app-key counter tags them `result="not_attested"`, and the gate's own
-counter is `kms_verifier_total{result="denied"}`.
+counter is `kms_verifier_total{result="denied"}`. Note scan's `verified` requires the boot
+chain to match a **published reference set** — so a node running an image whose reference
+values were never published is a definite denial, not an outage; `verifier_denied` therefore
+includes image-class denials, not just revocations.
 
 One liveness note for the runbook: a rogue on-chain entry can never pass gossip under the gate,
 so operations that wait for *full* membership (genesis, /refresh) stall until the entry is

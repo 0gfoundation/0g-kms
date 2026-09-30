@@ -60,9 +60,11 @@ impl TappConfig {
 pub struct VerifierConfig {
     /// Base URL, e.g. "https://scan.example". Plain http is refused unless `insecure_http`.
     pub url: String,
-    /// Pinned attested TLS public keys (hex; the raw SubjectPublicKeyInfo key bits, i.e. the
-    /// `tls_public_key` scan's evidence carries). A set, so a scan identity rotation can be
-    /// rolled without a flag day. The pin — not any CA — is the whole authenticity story.
+    /// Pinned attested TLS keys: hex of **sha256 over the SubjectPublicKeyInfo DER** (32 bytes
+    /// each) — the curl `--pinnedpubkey` convention, and exactly the `tls_public_key` value
+    /// scan's evidence carries / its API publishes. NOT the raw key bits. A set, so a scan
+    /// identity rotation can be rolled without a flag day. The pin — not any CA — is the whole
+    /// authenticity story.
     #[serde(default)]
     pub pubkeys: Vec<String>,
     /// API key for scan's higher rate-limit tier. QoS only, NOT a security boundary — a stolen

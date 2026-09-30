@@ -27,6 +27,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use sha2::Digest as _;
 use ethers::types::Address;
 use tokio::sync::{Mutex, RwLock};
 
@@ -52,10 +53,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// the attested cert is self-signed by design, and the entire trust decision is "does the
 /// server hold the pinned attested key" — possession is proven by the TLS handshake signature,
 /// which is still verified (below) with the provider's real algorithms.
+///
+/// The pinned value is **sha256 of the full SubjectPublicKeyInfo DER** — the curl
+/// `--pinnedpubkey` convention, and exactly the `tls_public_key` scan's evidence carries and
+/// its `/api/apps/:app_id/cert` publishes. NOT the raw key bits: for scan's P-256 key those
+/// would be the 65-byte uncompressed point, a different value entirely — comparing against the
+/// wrong encoding was PR #15's second-round blocker, caught because as-documented no handshake
+/// could ever succeed.
 #[derive(Debug)]
 struct PinnedKeyVerifier {
-    /// Raw SubjectPublicKeyInfo key bytes (e.g. the 32 bytes of an Ed25519 key). A small set,
-    /// not a single key, so a scan identity rotation can be rolled without a flag day.
+    /// sha256(SPKI DER) values, 32 bytes each. A small set, not a single key, so a scan
+    /// identity rotation can be rolled without a flag day.
     pinned: Vec<Vec<u8>>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
@@ -71,7 +79,11 @@ impl rustls::client::danger::ServerCertVerifier for PinnedKeyVerifier {
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
             .map_err(|e| rustls::Error::General(format!("verifier cert unparseable: {e}")))?;
-        let presented = cert.public_key().subject_public_key.data.as_ref();
+        // Hash the WHOLE SubjectPublicKeyInfo DER (algorithm header included) — hashing only
+        // the inner bit string is not the --pinnedpubkey convention and would not match the
+        // value scan publishes.
+        let presented: [u8; 32] =
+            sha2::Sha256::digest(cert.tbs_certificate.subject_pki.raw).into();
         if self.pinned.iter().any(|k| k.as_slice() == presented) {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
@@ -185,10 +197,15 @@ impl Verifier {
                 .map(|k| {
                     let bytes = hex::decode(k.trim_start_matches("0x"))
                         .map_err(|e| anyhow!("[verifier] pubkey {k} is not hex: {e}"))?;
-                    if bytes.is_empty() {
-                        // An empty key can never match a presented cert — sloppy config that
-                        // would otherwise pass boot and refuse every handshake forever.
-                        return Err(anyhow!("[verifier] empty pubkey entry"));
+                    if bytes.len() != 32 {
+                        // The pin is sha256 of the SPKI DER — always 32 bytes. A 65-byte value
+                        // is the raw EC point (the wrong encoding this check exists to catch);
+                        // empty/short values are sloppy config. All fail the boot loudly.
+                        return Err(anyhow!(
+                            "[verifier] pubkey {k} is {} bytes; expected the 32-byte sha256 of \
+                             the SPKI DER (scan's tls_public_key, curl --pinnedpubkey value)",
+                            bytes.len()
+                        ));
                     }
                     Ok(bytes)
                 })
@@ -280,7 +297,7 @@ impl Verifier {
                 crate::metrics::inc(&m.verifier_unavailable_refused);
                 tracing::warn!(app_id, signer = ?signer, error = %e,
                     "verifier unreachable and signer has no fresh-enough verdict — refusing");
-                Err("attestation verifier unreachable and this signer has no prior verdict".into())
+                Err("attestation verifier unreachable and this signer has no fresh-enough verdict".into())
             }
         };
         drop(cache);
@@ -383,12 +400,15 @@ mod tests {
         }
     }
 
-    /// The pin is the entire authenticity story, so test it against real DER: a cert carrying
-    /// the pinned key passes, any other key fails — regardless of names, expiry, or issuer.
+    /// The pin is the entire authenticity story, so test it with P-256 — the curve scan
+    /// actually serves, and the one where "raw point" and "SPKI hash" are different values.
+    /// The expected pin is minted from rcgen's own SPKI DER (`public_key_der`), an independent
+    /// derivation from the extraction under test — the previous Ed25519 version minted its
+    /// expectation through the code under test and was structurally blind to the encoding bug.
     #[test]
     fn pin_accepts_exactly_the_pinned_key() {
-        let kp1 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-        let kp2 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let kp1 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let kp2 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let cert1 = rcgen::CertificateParams::new(vec!["scan".into()])
             .unwrap()
             .self_signed(&kp1)
@@ -398,19 +418,48 @@ mod tests {
             .self_signed(&kp2)
             .unwrap();
 
+        let pin1: [u8; 32] = sha2::Sha256::digest(kp1.public_key_der()).into();
         let v = PinnedKeyVerifier {
-            pinned: vec![kp1.public_key_raw().to_vec()],
+            pinned: vec![pin1.to_vec()],
             provider: Arc::new(rustls::crypto::ring::default_provider()),
         };
         let name = rustls::pki_types::ServerName::try_from("scan").unwrap();
         let now = rustls::pki_types::UnixTime::now();
 
+        assert!(v.verify_server_cert(cert1.der(), &[], &name, &[], now).is_ok());
+        assert!(v.verify_server_cert(cert2.der(), &[], &name, &[], now).is_err());
+
+        // And the raw 65-byte point must NOT be accepted as a pin — that is exactly the wrong
+        // encoding the second-round review caught.
+        let raw_point = PinnedKeyVerifier {
+            pinned: vec![kp1.public_key_raw().to_vec()],
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        };
+        assert!(raw_point.verify_server_cert(cert1.der(), &[], &name, &[], now).is_err());
+    }
+
+    /// Ground truth from OUTSIDE this codebase: a P-256 certificate generated with openssl and
+    /// its pin computed by `openssl x509 -pubkey | openssl pkey -pubin -outform der | sha256sum`
+    /// — the documented operator flow. If the extraction ever hashes the wrong bytes again,
+    /// this vector fails regardless of how the expectation in the other test is minted.
+    #[test]
+    fn pin_matches_openssl_derived_vector() {
+        use base64::Engine as _;
+        const CERT_DER_B64: &str = "MIIBcjCCARmgAwIBAgIUfCxSzNoq7qm/oi1ugTmy7eEmbPUwCgYIKoZIzj0EAwIwDzENMAsGA1UEAwwEc2NhbjAeFw0yNjA5MzAwMzM4MjBaFw0zNjA5MjcwMzM4MjBaMA8xDTALBgNVBAMMBHNjYW4wWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARrYuw2nBIQxct5l9TmkbvUPlToniTlW4UE+sriPnXJeJQCfRax99BTnXoJwFuG3C7ljvv+Fpy21KvK03m77jwio1MwUTAdBgNVHQ4EFgQUTZ063JN8YVwx4edU98NTSNGnYyowHwYDVR0jBBgwFoAUTZ063JN8YVwx4edU98NTSNGnYyowDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiA8Btl0CoZIB0Kvj8MZgWUpHq2p/ALnmd4NzMqRHZWN2QIgeT7JsgO7FL+9vtGEUpIlBjV6dChnKvkjJBACgcS1RJM=";
+        const OPENSSL_PIN: &str = "915497ac63671c8f78b8cecda9ca2c01e6c702de46bb71091252b60b0b375c80";
+
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(CERT_DER_B64)
+            .unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(der);
+        let v = PinnedKeyVerifier {
+            pinned: vec![hex::decode(OPENSSL_PIN).unwrap()],
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        };
+        let name = rustls::pki_types::ServerName::try_from("scan").unwrap();
         assert!(v
-            .verify_server_cert(cert1.der(), &[], &name, &[], now)
+            .verify_server_cert(&cert, &[], &name, &[], rustls::pki_types::UnixTime::now())
             .is_ok());
-        assert!(v
-            .verify_server_cert(cert2.der(), &[], &name, &[], now)
-            .is_err());
     }
 
     /// Finding 1 of the PR review: a malformed [verifier] must fail at construction, not at
@@ -427,9 +476,16 @@ mod tests {
             };
             assert!(Verifier::new(cfg).is_err(), "{url} must be rejected at boot");
         }
-        // https with no pins, non-hex pin, and an EMPTY pin (hex-decodes to zero bytes and
-        // could never match a presented cert) must all be rejected
-        for pubkeys in [vec![], vec!["zz".to_string()], vec!["".to_string()], vec!["0x".to_string()]] {
+        // https with no pins, non-hex, empty, and WRONG-LENGTH pins must all be rejected —
+        // notably the 65-byte raw EC point, the encoding mixup the second review round caught
+        for pubkeys in [
+            vec![],
+            vec!["zz".to_string()],
+            vec!["".to_string()],
+            vec!["0x".to_string()],
+            vec!["0x7b13d132".to_string()],          // 4 bytes: truncated hash
+            vec![format!("0x04{}", "ab".repeat(64))], // 65 bytes: raw uncompressed point
+        ] {
             let cfg = VerifierConfig {
                 url: "https://scan.example".into(),
                 pubkeys,
@@ -438,10 +494,10 @@ mod tests {
             };
             assert!(Verifier::new(cfg).is_err());
         }
-        // and a well-formed one builds
+        // and a well-formed one (a real 32-byte sha256) builds
         let cfg = VerifierConfig {
             url: "https://scan.example".into(),
-            pubkeys: vec!["0x7b13d132".into()],
+            pubkeys: vec![format!("0x{}", "ab".repeat(32))],
             api_key: String::new(),
             insecure_http: false,
         };

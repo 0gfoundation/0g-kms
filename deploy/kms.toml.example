@@ -33,8 +33,10 @@ seeds = [
 # only. Enable once tappscan serves its attested TLS key (0g-tapp-verifier#14).
 # [verifier]
 # url     = "https://<SCAN_HOST>"
-# # scan's attested TLS pubkey(s) — the tls_public_key its evidence carries. The pin IS the
-# # authenticity story (no CA). A set, so a scan identity rotation can roll without a flag day.
-# pubkeys = ["<SCAN_ATTESTED_TLS_PUBKEY_HEX>"]
+# # scan's attested TLS key pin(s): sha256 of the SPKI DER, 32 bytes hex — exactly the
+# # tls_public_key scan's evidence carries (curl --pinnedpubkey convention; also served by
+# # scan's /api/apps/<id>/cert). NOT the raw EC point. The pin IS the authenticity story
+# # (no CA). A set, so a scan identity rotation can roll without a flag day.
+# pubkeys = ["<SHA256_OF_SCAN_SPKI_DER_HEX>"]
 # # QoS tier only, not a security boundary — plaintext here is fine.
 # api_key = "<SCAN_API_KEY>"
