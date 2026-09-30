@@ -139,6 +139,12 @@ pub async fn verify_cluster_response(message: &[u8], sig_bytes: &[u8], config: &
     if !nodes.contains(&signer) {
         return Err(anyhow!("response signer {:?} is not a registered node", signer));
     }
+    // Attested admission, outbound direction (PR #15 review finding 2): without this, the same
+    // rogue nodeList entry the inbound gates refuse could still *serve* responses — configured
+    // as a seed, it could hand a rejoining node an attacker-chosen share. Cached, so ~free.
+    crate::verifier::require_verified(&config.tapp.app_id, &signer)
+        .await
+        .map_err(|reason| anyhow!("response signer failed attestation gate: {}", reason))?;
     Ok(())
 }
 

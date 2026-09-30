@@ -119,7 +119,12 @@ The KMS pins scan's **attested TLS key** from config — no CA involved — and 
 over that channel. Verdicts are cached per (app_id, signer); signer keys rotate with the host's
 tapp-server, so cache generations track identity generations for free. Failure is closed *for
 the increment only*: a verified signer keeps working from cache while scan is down, an unseen
-signer is refused. Denials return 403 and are counted as `result="not_attested"`.
+signer is refused. Denials return 403; the app-key counter tags them `result="not_attested"`, and the gate's own
+counter is `kms_verifier_total{result="denied"}`.
+
+One liveness note for the runbook: a rogue on-chain entry can never pass gossip under the gate,
+so operations that wait for *full* membership (genesis, /refresh) stall until the entry is
+removed on-chain — the gate holds in the meantime; remove the entry to restore convergence.
 
 Scan itself is never vouched for by its own verdicts: verifying scan is a public, human-
 reproducible act (reference values live in the 0g-tapp-verifier repo), and the pin is its

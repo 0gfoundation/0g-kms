@@ -118,18 +118,33 @@ impl rustls::client::danger::ServerCertVerifier for PinnedKeyVerifier {
 
 // ─── Client ─────────────────────────────────────────────────────────────────────
 
+/// Cap on how long a positive verdict may be served past the last *successful* confirmation.
+/// Without it, every failed hourly refresh against a down scan would re-stamp the stale
+/// positive and a verified-then-revoked signer would keep working for the whole outage
+/// (PR #15 review finding 3). With it, a sustained scan outage degrades existing traffic only
+/// after this long — a deliberate availability/revocation-latency trade.
+const MAX_VERDICT_STALENESS: Duration = Duration::from_secs(24 * 3600);
+
 struct CacheEntry {
     verified: bool,
+    /// Damping stamp: drives the hourly-refresh / 30s-negative TTLs. Re-stamped on a failed
+    /// refresh so a dead scan is not re-queried on every request.
     at: Instant,
+    /// Last *successful* positive confirmation from scan. Never moved by failures — this is
+    /// what bounds how long a revocation can stay invisible.
+    confirmed_at: Instant,
 }
+
+type Key = (String, Address);
 
 pub struct Verifier {
     cfg: VerifierConfig,
     client: reqwest::Client,
-    cache: RwLock<HashMap<(String, Address), CacheEntry>>,
-    /// Single-flight for fetches: a node restart makes every in-flight derive discover the
-    /// same new signer at once; one of them asks scan, the rest wait and read the cache.
-    fetch_lock: Mutex<()>,
+    cache: RwLock<HashMap<Key, CacheEntry>>,
+    /// Per-key single-flight (PR #15 review finding 4): a node restart makes every in-flight
+    /// derive discover the same new signer at once — one fetches, the rest wait. Per KEY, not
+    /// global: N distinct first-seen signers must not serialize behind one slow 10s fetch.
+    fetch_locks: Mutex<HashMap<Key, Arc<Mutex<()>>>>,
 }
 
 /// What `POST {url}/verify` returns (contract in 0g-tapp-verifier#14).
@@ -142,6 +157,15 @@ struct VerifyResponse {
 
 impl Verifier {
     pub fn new(cfg: VerifierConfig) -> Result<Self> {
+        // Boot invariant (PR #15 review finding 1): a malformed [verifier] must fail HERE,
+        // loudly — not per-request, where a typo'd scheme is indistinguishable from a scan
+        // outage and quietly freezes admission of new signers.
+        if !cfg.url.starts_with("http://") && !cfg.url.starts_with("https://") {
+            return Err(anyhow!(
+                "[verifier] url must start with http:// or https://, got {:?}",
+                cfg.url
+            ));
+        }
         let client = if let Some(rest) = cfg.url.strip_prefix("http://") {
             // Plaintext = no pin = no authenticity. Only for tests against a local mock.
             if !cfg.insecure_http {
@@ -159,8 +183,14 @@ impl Verifier {
                 .pubkeys
                 .iter()
                 .map(|k| {
-                    hex::decode(k.trim_start_matches("0x"))
-                        .map_err(|e| anyhow!("[verifier] pubkey {k} is not hex: {e}"))
+                    let bytes = hex::decode(k.trim_start_matches("0x"))
+                        .map_err(|e| anyhow!("[verifier] pubkey {k} is not hex: {e}"))?;
+                    if bytes.is_empty() {
+                        // An empty key can never match a presented cert — sloppy config that
+                        // would otherwise pass boot and refuse every handshake forever.
+                        return Err(anyhow!("[verifier] empty pubkey entry"));
+                    }
+                    Ok(bytes)
                 })
                 .collect::<Result<_>>()?;
             if pinned.is_empty() {
@@ -185,79 +215,97 @@ impl Verifier {
             cfg,
             client,
             cache: RwLock::new(HashMap::new()),
-            fetch_lock: Mutex::new(()),
+            fetch_locks: Mutex::new(HashMap::new()),
         })
     }
 
     /// Gate a signer. `Ok(())` = derive/serve; `Err(reason)` = refuse (the reason is safe to
     /// return to the caller — it describes their admission status, nothing internal).
     pub async fn require_verified(&self, app_id: &str, signer: &Address) -> Result<(), String> {
-        let key = (app_id.to_string(), *signer);
+        let key: Key = (app_id.to_string(), *signer);
         let m = crate::metrics::m();
 
-        if let Some(e) = self.cache.read().await.get(&key) {
-            if e.verified && e.at.elapsed() < POSITIVE_REFRESH {
-                crate::metrics::inc(&m.verifier_allowed);
-                return Ok(());
-            }
-            if !e.verified && e.at.elapsed() < NEGATIVE_TTL {
-                crate::metrics::inc(&m.verifier_denied);
-                return Err("attestation not verified (recently checked)".into());
-            }
+        if let Some(d) = self.cached_decision(&key).await {
+            return d;
         }
 
-        // Single-flight; re-check under the lock — the winner has usually already filled it.
-        let _g = self.fetch_lock.lock().await;
-        if let Some(e) = self.cache.read().await.get(&key) {
-            if e.verified && e.at.elapsed() < POSITIVE_REFRESH {
-                crate::metrics::inc(&m.verifier_allowed);
-                return Ok(());
-            }
-            if !e.verified && e.at.elapsed() < NEGATIVE_TTL {
-                crate::metrics::inc(&m.verifier_denied);
-                return Err("attestation not verified (recently checked)".into());
-            }
+        // Per-key single-flight; re-check under the lock — the winner usually filled the cache.
+        let key_lock = {
+            let mut locks = self.fetch_locks.lock().await;
+            locks.entry(key.clone()).or_default().clone()
+        };
+        let _g = key_lock.lock().await;
+        if let Some(d) = self.cached_decision(&key).await {
+            return d;
         }
 
-        match self.fetch(app_id, signer).await {
+        let outcome = self.fetch(app_id, signer).await;
+        let now = Instant::now();
+        let mut cache = self.cache.write().await;
+        // Bound the cache: entries whose damping stamp is far past every TTL are dead weight
+        // (each signer generation leaves one behind, forever). Amortized on the fetch path,
+        // which is already the slow path.
+        if cache.len() > 4096 {
+            cache.retain(|_, e| e.at.elapsed() < MAX_VERDICT_STALENESS);
+        }
+        let result = match outcome {
             Ok((true, _)) => {
-                self.cache
-                    .write()
-                    .await
-                    .insert(key, CacheEntry { verified: true, at: Instant::now() });
+                cache.insert(key.clone(), CacheEntry { verified: true, at: now, confirmed_at: now });
                 crate::metrics::inc(&m.verifier_allowed);
                 Ok(())
             }
             Ok((false, reason)) => {
-                self.cache
-                    .write()
-                    .await
-                    .insert(key, CacheEntry { verified: false, at: Instant::now() });
+                // A fresh negative resets confirmed_at too: an explicit revocation must not
+                // leave a stale-positive escape hatch behind.
+                cache.insert(key.clone(), CacheEntry { verified: false, at: now, confirmed_at: now });
                 crate::metrics::inc(&m.verifier_denied);
                 tracing::warn!(app_id, signer = ?signer, %reason, "verifier denied signer");
                 Err(format!("attestation not verified: {reason}"))
             }
             Err(e) => {
-                // Scan unreachable / rate-limited / broken. A stale positive keeps working —
-                // re-stamp it so the next hour is served from cache instead of re-queueing on a
-                // dead scan every request. No positive history → refuse (fail-closed for new).
-                let mut cache = self.cache.write().await;
+                // Scan unreachable / rate-limited / broken. A positive confirmed within the
+                // staleness cap keeps working — re-stamp the damping clock so a dead scan is
+                // retried hourly, not per request. `confirmed_at` is deliberately NOT moved:
+                // it is what bounds how long a revocation can stay invisible during an outage.
                 if let Some(entry) = cache.get_mut(&key) {
-                    if entry.verified {
-                        entry.at = Instant::now();
-                        crate::metrics::inc(&m.verifier_unavailable);
+                    if entry.verified && entry.confirmed_at.elapsed() < MAX_VERDICT_STALENESS {
+                        entry.at = now;
+                        crate::metrics::inc(&m.verifier_stale_served);
                         tracing::warn!(app_id, signer = ?signer, error = %e,
                             "verifier unreachable — serving stale positive verdict");
                         return Ok(());
                     }
                 }
-                cache.insert(key, CacheEntry { verified: false, at: Instant::now() });
-                crate::metrics::inc(&m.verifier_unavailable);
+                cache.insert(key.clone(), CacheEntry { verified: false, at: now, confirmed_at: now });
+                crate::metrics::inc(&m.verifier_unavailable_refused);
                 tracing::warn!(app_id, signer = ?signer, error = %e,
-                    "verifier unreachable and signer never verified — refusing");
+                    "verifier unreachable and signer has no fresh-enough verdict — refusing");
                 Err("attestation verifier unreachable and this signer has no prior verdict".into())
             }
+        };
+        drop(cache);
+        // The lock map only ever needs entries someone is actively fetching.
+        self.fetch_locks.lock().await.remove(&key);
+        result
+    }
+
+    /// Cache-only decision: `Some(Ok)` allow, `Some(Err)` deny, `None` = must ask scan.
+    async fn cached_decision(&self, key: &Key) -> Option<Result<(), String>> {
+        let m = crate::metrics::m();
+        let cache = self.cache.read().await;
+        let e = cache.get(key)?;
+        if e.verified
+            && e.at.elapsed() < POSITIVE_REFRESH
+            && e.confirmed_at.elapsed() < MAX_VERDICT_STALENESS
+        {
+            crate::metrics::inc(&m.verifier_allowed);
+            return Some(Ok(()));
         }
+        if !e.verified && e.at.elapsed() < NEGATIVE_TTL {
+            crate::metrics::inc(&m.verifier_denied);
+            return Some(Err("attestation not verified (recently checked)".into()));
+        }
+        None
     }
 
     async fn fetch(&self, app_id: &str, signer: &Address) -> Result<(bool, String)> {
@@ -363,6 +411,41 @@ mod tests {
         assert!(v
             .verify_server_cert(cert2.der(), &[], &name, &[], now)
             .is_err());
+    }
+
+    /// Finding 1 of the PR review: a malformed [verifier] must fail at construction, not at
+    /// the first request where it is indistinguishable from a scan outage.
+    #[test]
+    fn malformed_config_fails_at_boot() {
+        // scheme-less / typo'd scheme
+        for url in ["scan.example", "tcp://scan.example", "htps://scan.example"] {
+            let cfg = VerifierConfig {
+                url: url.into(),
+                pubkeys: vec!["0xabcd".into()],
+                api_key: String::new(),
+                insecure_http: false,
+            };
+            assert!(Verifier::new(cfg).is_err(), "{url} must be rejected at boot");
+        }
+        // https with no pins, non-hex pin, and an EMPTY pin (hex-decodes to zero bytes and
+        // could never match a presented cert) must all be rejected
+        for pubkeys in [vec![], vec!["zz".to_string()], vec!["".to_string()], vec!["0x".to_string()]] {
+            let cfg = VerifierConfig {
+                url: "https://scan.example".into(),
+                pubkeys,
+                api_key: String::new(),
+                insecure_http: false,
+            };
+            assert!(Verifier::new(cfg).is_err());
+        }
+        // and a well-formed one builds
+        let cfg = VerifierConfig {
+            url: "https://scan.example".into(),
+            pubkeys: vec!["0x7b13d132".into()],
+            api_key: String::new(),
+            insecure_http: false,
+        };
+        assert!(Verifier::new(cfg).is_ok());
     }
 
     /// The full verdict lifecycle against a mock scan: allow is cached (scan can die and the
