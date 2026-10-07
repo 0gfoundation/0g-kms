@@ -9,7 +9,7 @@ use sha3::{Digest, Keccak256};
 use tokio::sync::RwLock;
 
 use crate::{
-    chain::get_signer_addresses,
+    chain::get_signer_addresses_for,
     config::Config,
     crypto::ecies_encrypt,
     error::KmsError,
@@ -261,10 +261,11 @@ async fn app_key_inner(
     let message = format!("GetSecretResource:{}", req.timestamp);
     let recovered_addr = recover_eip191_address(&message, &req.signature)?;
 
-    let signer_addresses = get_signer_addresses(
+    let signer_addresses = get_signer_addresses_for(
         &state.config.chain.rpc_url,
         &state.config.chain.contract_address,
         &req.app_id,
+        &recovered_addr,
     )
     .await?;
 
@@ -281,8 +282,12 @@ async fn app_key_inner(
     // 2b. Attested admission (issue #14): being in the owner-written on-chain list is
     //     endorsement, not proof of TEE — require a verified-evidence verdict for this signer.
     //     No-op until [verifier] is configured.
-    crate::verifier::require_verified(&req.app_id, &recovered_addr)
-        .await
+    crate::verifier::require_verified(
+        &req.app_id,
+        &recovered_addr,
+        crate::verifier::SCAN_LAG_WAIT,
+    )
+    .await
         .map_err(KmsError::NotAttested)?;
 
     // 3. Threshold-BLS DPRF: collect partials from ≥ threshold nodes and combine them into

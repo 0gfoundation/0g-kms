@@ -21,6 +21,11 @@
 //! damped for thirty seconds (so a burst of derives can't hammer scan). Signer keys rotate on
 //! every tapp-server restart, so the cache needs no identity-generation logic: a new identity
 //! is simply a new key.
+//!
+//! Scan not knowing a signer (404) is neither: every caller has already found that signer in
+//! the on-chain list itself, so it means scan has not synced the registration yet — the normal
+//! state for a node that restarted and re-registered seconds ago. `/app-key` keeps asking for a
+//! few seconds, and if scan still does not know the signer the refusal is not cached.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -46,6 +51,22 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 /// One verify round-trip may include scan fetching evidence from the target node and running
 /// the attestation service — seconds, not milliseconds.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long `/app-key` keeps asking when scan does not know a signer this KMS has just found
+/// on chain. Scan follows the chain on a schedule and forces a sync for an unknown target at
+/// most every 10s, so a node that re-registered on restart is usually known within this. Peer
+/// calls pass zero: their callers time out after 3s and retry on their own loops.
+pub const SCAN_LAG_WAIT: Duration = Duration::from_secs(12);
+const SCAN_LAG_POLL: Duration = Duration::from_secs(3);
+
+/// After a wait that ended with scan still not knowing the signer, requests for it get the same
+/// answer for this long instead of each starting a wait of their own. Deliberately not the
+/// 30s negative damping: the signer is on chain, scan is behind, and the caller will retry.
+const SCAN_LAG_DAMP: Duration = Duration::from_secs(3);
+
+/// What scan's 404 is reported as. tapp-server's KMS client waits on this text (0g-tapp#136),
+/// so it is a contract, not just a message.
+const NOT_REGISTERED: &str = "not registered on-chain per verifier";
 
 // ─── Pinned-key TLS ─────────────────────────────────────────────────────────────
 
@@ -139,6 +160,10 @@ const MAX_VERDICT_STALENESS: Duration = Duration::from_secs(24 * 3600);
 
 struct CacheEntry {
     verified: bool,
+    /// For a refusal: what a caller is told while it is answered from cache.
+    refusal: String,
+    /// For a refusal: how long it is answered from cache.
+    damp: Duration,
     /// Damping stamp: drives the hourly-refresh / 30s-negative TTLs. Re-stamped on a failed
     /// refresh so a dead scan is not re-queried on every request.
     at: Instant,
@@ -159,12 +184,21 @@ pub struct Verifier {
     fetch_locks: Mutex<HashMap<Key, Arc<Mutex<()>>>>,
 }
 
-/// What `POST {url}/verify` returns (contract in 0g-tapp-verifier#14).
+/// What `POST {url}/verify` returns (contract in 0g-tapp-verifier#14). Scan also returns
+/// `warnings` and `image_env`; a verdict scan has already failed (DEBUG TD, revoked TCB, a dev
+/// image on mainnet) arrives as `verified: false`, so the KMS needs only these two.
 #[derive(serde::Deserialize)]
 struct VerifyResponse {
     verified: bool,
     #[serde(default)]
     reason: String,
+}
+
+enum Answer {
+    Verdict { verified: bool, reason: String },
+    /// Scan does not know (app_id, signer). Every caller has found the signer in its own
+    /// on-chain list first, so this means scan is behind the chain.
+    Unknown,
 }
 
 impl Verifier {
@@ -238,7 +272,15 @@ impl Verifier {
 
     /// Gate a signer. `Ok(())` = derive/serve; `Err(reason)` = refuse (the reason is safe to
     /// return to the caller — it describes their admission status, nothing internal).
-    pub async fn require_verified(&self, app_id: &str, signer: &Address) -> Result<(), String> {
+    ///
+    /// The caller must already have found `signer` in the app's on-chain list. `scan_lag_wait`
+    /// is how long to keep asking if scan has not caught up with that list yet.
+    pub async fn require_verified(
+        &self,
+        app_id: &str,
+        signer: &Address,
+        scan_lag_wait: Duration,
+    ) -> Result<(), String> {
         let key: Key = (app_id.to_string(), *signer);
         let m = crate::metrics::m();
 
@@ -256,7 +298,18 @@ impl Verifier {
             return d;
         }
 
-        let outcome = self.fetch(app_id, signer).await;
+        let mut outcome = self.fetch(app_id, signer).await;
+        // A signer with a usable positive is served from it at once if scan does not know it;
+        // only a signer with nothing to fall back on waits for scan to catch up.
+        if !self.has_stale_positive(&key).await {
+            let deadline = Instant::now() + scan_lag_wait;
+            while matches!(outcome, Ok(Answer::Unknown))
+                && Instant::now() + SCAN_LAG_POLL <= deadline
+            {
+                tokio::time::sleep(SCAN_LAG_POLL).await;
+                outcome = self.fetch(app_id, signer).await;
+            }
+        }
         let now = Instant::now();
         let mut cache = self.cache.write().await;
         // Bound the cache: entries whose damping stamp is far past every TTL are dead weight
@@ -265,35 +318,83 @@ impl Verifier {
         if cache.len() > 4096 {
             cache.retain(|_, e| e.at.elapsed() < MAX_VERDICT_STALENESS);
         }
+        let refused = |refusal: String, damp: Duration| CacheEntry {
+            verified: false,
+            refusal,
+            damp,
+            at: now,
+            confirmed_at: now,
+        };
+        // Scan cannot answer for this signer right now — unreachable, or behind the chain. A
+        // positive confirmed within the staleness cap keeps working: re-stamp the damping
+        // clock so a dead scan is retried hourly, not per request. `confirmed_at` is
+        // deliberately NOT moved: it is what bounds how long a revocation can stay invisible.
+        let restamp_stale = |cache: &mut HashMap<Key, CacheEntry>| match cache.get_mut(&key) {
+            Some(e) if e.verified && e.confirmed_at.elapsed() < MAX_VERDICT_STALENESS => {
+                e.at = now;
+                true
+            }
+            _ => false,
+        };
         let result = match outcome {
-            Ok((true, _)) => {
-                cache.insert(key.clone(), CacheEntry { verified: true, at: now, confirmed_at: now });
+            Ok(Answer::Verdict { verified: true, .. }) => {
+                cache.insert(
+                    key.clone(),
+                    CacheEntry {
+                        verified: true,
+                        refusal: String::new(),
+                        damp: Duration::ZERO,
+                        at: now,
+                        confirmed_at: now,
+                    },
+                );
                 crate::metrics::inc(&m.verifier_allowed);
                 Ok(())
             }
-            Ok((false, reason)) => {
+            Ok(Answer::Verdict { verified: false, reason }) => {
                 // A fresh negative resets confirmed_at too: an explicit revocation must not
                 // leave a stale-positive escape hatch behind.
-                cache.insert(key.clone(), CacheEntry { verified: false, at: now, confirmed_at: now });
+                cache.insert(
+                    key.clone(),
+                    refused(
+                        format!("attestation not verified (recently checked): {reason}"),
+                        NEGATIVE_TTL,
+                    ),
+                );
                 crate::metrics::inc(&m.verifier_denied);
                 tracing::warn!(app_id, signer = ?signer, %reason, "verifier denied signer");
                 Err(format!("attestation not verified: {reason}"))
             }
+            Ok(Answer::Unknown) if restamp_stale(&mut cache) => {
+                crate::metrics::inc(&m.verifier_stale_served);
+                tracing::warn!(app_id, signer = ?signer,
+                    "verifier does not know an on-chain signer — serving stale positive verdict");
+                Ok(())
+            }
+            Ok(Answer::Unknown) => {
+                // Not a negative: the signer is on chain and scan has not synced it. Only a
+                // brief marker, so requests queued behind this one don't each wait again.
+                let refusal = format!("attestation not verified: {NOT_REGISTERED}");
+                cache.insert(key.clone(), refused(refusal.clone(), SCAN_LAG_DAMP));
+                crate::metrics::inc(&m.verifier_scan_behind);
+                tracing::warn!(app_id, signer = ?signer, waited_s = scan_lag_wait.as_secs(),
+                    "verifier does not know an on-chain signer yet — refusing until it syncs");
+                Err(refusal)
+            }
+            Err(e) if restamp_stale(&mut cache) => {
+                crate::metrics::inc(&m.verifier_stale_served);
+                tracing::warn!(app_id, signer = ?signer, error = %e,
+                    "verifier unreachable — serving stale positive verdict");
+                Ok(())
+            }
             Err(e) => {
-                // Scan unreachable / rate-limited / broken. A positive confirmed within the
-                // staleness cap keeps working — re-stamp the damping clock so a dead scan is
-                // retried hourly, not per request. `confirmed_at` is deliberately NOT moved:
-                // it is what bounds how long a revocation can stay invisible during an outage.
-                if let Some(entry) = cache.get_mut(&key) {
-                    if entry.verified && entry.confirmed_at.elapsed() < MAX_VERDICT_STALENESS {
-                        entry.at = now;
-                        crate::metrics::inc(&m.verifier_stale_served);
-                        tracing::warn!(app_id, signer = ?signer, error = %e,
-                            "verifier unreachable — serving stale positive verdict");
-                        return Ok(());
-                    }
-                }
-                cache.insert(key.clone(), CacheEntry { verified: false, at: now, confirmed_at: now });
+                cache.insert(
+                    key.clone(),
+                    refused(
+                        "attestation not verified (recently checked): verifier unreachable".into(),
+                        NEGATIVE_TTL,
+                    ),
+                );
                 crate::metrics::inc(&m.verifier_unavailable_refused);
                 tracing::warn!(app_id, signer = ?signer, error = %e,
                     "verifier unreachable and signer has no fresh-enough verdict — refusing");
@@ -318,14 +419,22 @@ impl Verifier {
             crate::metrics::inc(&m.verifier_allowed);
             return Some(Ok(()));
         }
-        if !e.verified && e.at.elapsed() < NEGATIVE_TTL {
+        if !e.verified && e.at.elapsed() < e.damp {
             crate::metrics::inc(&m.verifier_denied);
-            return Some(Err("attestation not verified (recently checked)".into()));
+            return Some(Err(e.refusal.clone()));
         }
         None
     }
 
-    async fn fetch(&self, app_id: &str, signer: &Address) -> Result<(bool, String)> {
+    /// A positive that may still be served while scan cannot answer.
+    async fn has_stale_positive(&self, key: &Key) -> bool {
+        let cache = self.cache.read().await;
+        cache
+            .get(key)
+            .is_some_and(|e| e.verified && e.confirmed_at.elapsed() < MAX_VERDICT_STALENESS)
+    }
+
+    async fn fetch(&self, app_id: &str, signer: &Address) -> Result<Answer> {
         let mut req = self
             .client
             .post(format!("{}/verify", self.cfg.url.trim_end_matches('/')))
@@ -341,13 +450,11 @@ impl Verifier {
             s if s.is_success() => {
                 let v: VerifyResponse =
                     resp.json().await.map_err(|e| anyhow!("verify response: {e}"))?;
-                Ok((v.verified, v.reason))
+                Ok(Answer::Verdict { verified: v.verified, reason: v.reason })
             }
-            // Unknown (app_id, signer): scan rejects before fetching anything — the pair is not
-            // registered on-chain. A definite negative, not an outage.
-            reqwest::StatusCode::NOT_FOUND => {
-                Ok((false, "not registered on-chain per verifier".into()))
-            }
+            // Unknown (app_id, signer): scan rejects before fetching anything, because its
+            // copy of the registry does not have the pair.
+            reqwest::StatusCode::NOT_FOUND => Ok(Answer::Unknown),
             s => Err(anyhow!("verifier returned {s}")),
         }
     }
@@ -376,10 +483,14 @@ pub fn init(config: &Config) -> Result<()> {
 
 /// The admission gate used by the HTTP and gRPC paths. With no [verifier] configured this is a
 /// no-op — the feature ships dark and turns on with a config change once scan serves its
-/// attested key (0g-tapp-verifier#14).
-pub async fn require_verified(app_id: &str, signer: &Address) -> Result<(), String> {
+/// attested key (0g-tapp-verifier#14). See `Verifier::require_verified` for `scan_lag_wait`.
+pub async fn require_verified(
+    app_id: &str,
+    signer: &Address,
+    scan_lag_wait: Duration,
+) -> Result<(), String> {
     match VERIFIER.get() {
-        Some(Some(v)) => v.require_verified(app_id, signer).await,
+        Some(Some(v)) => v.require_verified(app_id, signer, scan_lag_wait).await,
         _ => Ok(()),
     }
 }
@@ -536,16 +647,115 @@ mod tests {
 
         let v = Verifier::new(test_cfg(scan.uri())).unwrap();
 
-        assert!(v.require_verified("app", &good).await.is_ok());
-        assert!(v.require_verified("app", &good).await.is_ok());
-        assert!(v.require_verified("app", &bad).await.is_err());
-        assert!(v.require_verified("app", &bad).await.is_err());
+        let no_wait = Duration::ZERO;
+        assert!(v.require_verified("app", &good, no_wait).await.is_ok());
+        assert!(v.require_verified("app", &good, no_wait).await.is_ok());
+        assert_eq!(
+            v.require_verified("app", &bad, no_wait).await,
+            Err("attestation not verified: replay failed".into())
+        );
+        // The damped repeat still says why.
+        assert_eq!(
+            v.require_verified("app", &bad, no_wait).await,
+            Err("attestation not verified (recently checked): replay failed".into())
+        );
 
         // Scan dies. The verified signer keeps working from cache; a never-seen signer is
         // refused — fail-closed applies to the increment only.
         drop(scan);
         let unseen: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
-        assert!(v.require_verified("app", &good).await.is_ok());
-        assert!(v.require_verified("app", &unseen).await.is_err());
+        assert!(v.require_verified("app", &good, no_wait).await.is_ok());
+        assert!(v.require_verified("app", &unseen, no_wait).await.is_err());
+    }
+
+    /// A node that restarted re-registers its new signer and asks for its key at once; scan,
+    /// which follows the chain on a schedule, answers 404 until it syncs. `/app-key` waits that
+    /// out inside the request (0g-kms#15 review).
+    #[tokio::test]
+    async fn a_signer_scan_has_not_synced_yet_is_waited_for() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let scan = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/verify"))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .mount(&scan)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/verify"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"verified": true})),
+            )
+            .expect(1)
+            .mount(&scan)
+            .await;
+
+        let v = Verifier::new(test_cfg(scan.uri())).unwrap();
+        let fresh: Address = "0x4444444444444444444444444444444444444444".parse().unwrap();
+        assert_eq!(v.require_verified("app", &fresh, SCAN_LAG_WAIT).await, Ok(()));
+    }
+
+    /// If scan still does not know the signer, the answer is the text tapp-server waits on, and
+    /// it is not damped like a negative: the signer is on chain, so the next try may succeed.
+    #[tokio::test]
+    async fn a_signer_scan_does_not_know_is_not_cached_as_a_negative() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let scan = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/verify"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1) // the immediate repeat is answered by the marker
+            .mount(&scan)
+            .await;
+
+        let v = Verifier::new(test_cfg(scan.uri())).unwrap();
+        let s: Address = "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let want = Err("attestation not verified: not registered on-chain per verifier".into());
+        assert_eq!(v.require_verified("app", &s, Duration::ZERO).await, want);
+        assert_eq!(v.require_verified("app", &s, Duration::ZERO).await, want);
+
+        let cache = v.cache.read().await;
+        let e = cache.get(&("app".to_string(), s)).unwrap();
+        assert!(!e.verified);
+        assert_eq!(e.damp, SCAN_LAG_DAMP);
+        assert!(SCAN_LAG_DAMP < NEGATIVE_TTL);
+    }
+
+    /// A signer with a positive past its hourly refresh keeps working if scan does not know it
+    /// (scan resynced its registry, say), and is not held up by the wait meant for new signers.
+    #[tokio::test]
+    async fn a_known_signer_is_not_held_up_when_scan_forgets_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let scan = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/verify"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&scan)
+            .await;
+
+        let v = Verifier::new(test_cfg(scan.uri())).unwrap();
+        let s: Address = "0x6666666666666666666666666666666666666666".parse().unwrap();
+        let two_hours_ago = Instant::now() - Duration::from_secs(2 * 3600);
+        v.cache.write().await.insert(
+            ("app".to_string(), s),
+            CacheEntry {
+                verified: true,
+                refusal: String::new(),
+                damp: Duration::ZERO,
+                at: two_hours_ago,
+                confirmed_at: two_hours_ago,
+            },
+        );
+
+        let started = Instant::now();
+        assert_eq!(v.require_verified("app", &s, SCAN_LAG_WAIT).await, Ok(()));
+        assert!(started.elapsed() < SCAN_LAG_POLL);
     }
 }

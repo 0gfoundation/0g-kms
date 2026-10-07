@@ -13,13 +13,15 @@
 /// On success returns the caller's recovered secp256k1 public key (65 bytes,
 /// uncompressed) and eth address so handlers can ECIES-encrypt responses and
 /// update the peer table.
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
 use ethers::types::Address;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use sha3::{Digest, Keccak256};
 use tonic::{metadata::MetadataMap, Status};
 
-use crate::chain::get_signer_addresses;
+use crate::chain::get_signer_addresses_for;
 use crate::config::Config;
 
 pub struct AuthContext {
@@ -61,7 +63,8 @@ pub async fn authenticate(
     // 4. Attested admission (issue #14): the nodeList proves owner endorsement only. This is
     //    the committee-side gate — the one that stops a stolen owner key from registering a
     //    non-TEE "node" and collecting a share via rejoin. No-op until [verifier] is configured.
-    crate::verifier::require_verified(&config.tapp.app_id, &caller_eth_addr)
+    //    No waiting for a lagging scan here: peer callers time out in seconds and retry.
+    crate::verifier::require_verified(&config.tapp.app_id, &caller_eth_addr, Duration::ZERO)
         .await
         .map_err(|reason| Status::permission_denied(format!("attestation gate: {}", reason)))?;
 
@@ -129,10 +132,11 @@ pub fn recover_signer_address(message: &[u8], sig_bytes: &[u8]) -> Result<Addres
 /// Callers MUST run this before decrypting/using a peer's ECIES response.
 pub async fn verify_cluster_response(message: &[u8], sig_bytes: &[u8], config: &Config) -> Result<()> {
     let signer = recover_signer_address(message, sig_bytes)?;
-    let nodes = get_signer_addresses(
+    let nodes = get_signer_addresses_for(
         &config.chain.rpc_url,
         &config.chain.contract_address,
         &config.tapp.app_id,
+        &signer,
     )
     .await
     .map_err(|e| anyhow!("nodeList lookup failed: {}", e))?;
@@ -142,7 +146,7 @@ pub async fn verify_cluster_response(message: &[u8], sig_bytes: &[u8], config: &
     // Attested admission, outbound direction (PR #15 review finding 2): without this, the same
     // rogue nodeList entry the inbound gates refuse could still *serve* responses — configured
     // as a seed, it could hand a rejoining node an attacker-chosen share. Cached, so ~free.
-    crate::verifier::require_verified(&config.tapp.app_id, &signer)
+    crate::verifier::require_verified(&config.tapp.app_id, &signer, Duration::ZERO)
         .await
         .map_err(|reason| anyhow!("response signer failed attestation gate: {}", reason))?;
     Ok(())
@@ -150,10 +154,11 @@ pub async fn verify_cluster_response(message: &[u8], sig_bytes: &[u8], config: &
 
 /// Verify that `addr` is registered in getNodeList(own_app_id) on-chain.
 async fn verify_on_chain(addr: &Address, config: &Config) -> Result<()> {
-    let signers = get_signer_addresses(
+    let signers = get_signer_addresses_for(
         &config.chain.rpc_url,
         &config.chain.contract_address,
         &config.tapp.app_id,
+        addr,
     )
     .await
     .map_err(|e| anyhow!("getNodeList failed: {}", e))?;

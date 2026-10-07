@@ -30,7 +30,10 @@ seeds = [
 ]
 
 # Attested admission (0g-kms#14). Optional — absent means admission is on-chain membership
-# only. Enable once tappscan serves its attested TLS key (0g-tapp-verifier#14).
+# only. Enable once tappscan serves its attested TLS key (0g-tapp-verifier#14), and not before
+# both of these are live, or nodes deadlock on start (see README "Attested admission"):
+#   * scan with 0g-tapp-verifier#16, and
+#   * on every node that fetches keys from this KMS, a tapp-server with 0g-tapp#145.
 # [verifier]
 # url     = "https://<SCAN_HOST>"
 # # scan's attested TLS key pin(s): sha256 of the SPKI DER, 32 bytes hex — exactly the

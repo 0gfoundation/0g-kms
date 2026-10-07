@@ -104,6 +104,10 @@ pub struct Metrics {
     /// Scan unreachable and the signer had no (fresh-enough) positive — refused, fail-closed.
     /// Actionable: new onboarding is blocked until scan answers.
     pub verifier_unavailable_refused: AtomicU64,
+    /// Scan did not know a signer this KMS had just found on chain, for the whole in-request
+    /// wait — refused without caching, the caller retries. A few after a node restart are
+    /// expected (scan follows the chain on a schedule); a steady rate means scan is stuck.
+    pub verifier_scan_behind: AtomicU64,
 
     pub gossip_push_ok: AtomicU64,
     pub gossip_push_fail: AtomicU64,
@@ -149,6 +153,7 @@ impl Metrics {
             verifier_denied: AtomicU64::new(0),
             verifier_stale_served: AtomicU64::new(0),
             verifier_unavailable_refused: AtomicU64::new(0),
+            verifier_scan_behind: AtomicU64::new(0),
             gossip_push_ok: AtomicU64::new(0),
             gossip_push_fail: AtomicU64::new(0),
             gossip_last_success: AtomicI64::new(0),
@@ -744,11 +749,13 @@ pub async fn render(state: &AppState) -> String {
          kms_verifier_total{{result=\"allowed\"}} {}\n\
          kms_verifier_total{{result=\"denied\"}} {}\n\
          kms_verifier_total{{result=\"unavailable_served_stale\"}} {}\n\
-         kms_verifier_total{{result=\"unavailable_refused\"}} {}\n",
+         kms_verifier_total{{result=\"unavailable_refused\"}} {}\n\
+         kms_verifier_total{{result=\"scan_behind\"}} {}\n",
         m.verifier_allowed.load(Relaxed),
         m.verifier_denied.load(Relaxed),
         m.verifier_stale_served.load(Relaxed),
         m.verifier_unavailable_refused.load(Relaxed),
+        m.verifier_scan_behind.load(Relaxed),
     );
 
     let _ = write!(

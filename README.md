@@ -126,7 +126,25 @@ signer is refused. Denials return 403; the app-key counter tags them `result="no
 counter is `kms_verifier_total{result="denied"}`. Note scan's `verified` requires the boot
 chain to match a **published reference set** — so a node running an image whose reference
 values were never published is a definite denial, not an outage; `verifier_denied` therefore
-includes image-class denials, not just revocations.
+includes image-class denials, not just revocations. Scan also fails a DEBUG TD, a revoked TCB,
+and on mainnet a dev image (0g-tapp-verifier#16); the KMS reads only `verified` and `reason`.
+A denial is answered from cache for 30s, as `attestation not verified (recently checked):
+<reason>`.
+
+Scan answering 404 for a signer is not a denial. The KMS asks scan only after finding the signer
+in the on-chain list itself, so a 404 means scan has not synced that registration yet — the
+normal state for a node that restarted and re-registered its new signer seconds ago. `/app-key`
+keeps asking for up to 12s; if scan still does not know the signer, the answer is `attestation
+not verified: not registered on-chain per verifier`, not cached as a denial (tapp-server waits
+on that text and retries), and counted as `kms_verifier_total{result="scan_behind"}`. Peer calls
+do not wait, since their callers time out in seconds and retry on their own. The KMS's own view
+of the node list works the same way: a signer missing from the cached list triggers one refresh
+(at most one per app every 5s) before it is refused.
+
+Two things must be live before the gate is turned on, or nodes deadlock: scan with
+0g-tapp-verifier#16, and on every node that fetches keys from this KMS, a tapp-server with
+0g-tapp#145 (without it, an encrypted app's evidence is not served until the app has started,
+and the app cannot start without its key).
 
 One liveness note for the runbook: a rogue on-chain entry can never pass gossip under the gate,
 so operations that wait for *full* membership (genesis, /refresh) stall until the entry is
