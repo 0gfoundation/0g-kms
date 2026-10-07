@@ -134,12 +134,17 @@ A denial is answered from cache for 30s, as `attestation not verified (recently 
 Scan answering 404 for a signer is not a denial. The KMS asks scan only after finding the signer
 in the on-chain list itself, so a 404 means scan has not synced that registration yet — the
 normal state for a node that restarted and re-registered its new signer seconds ago. `/app-key`
-keeps asking for up to 12s; if scan still does not know the signer, the answer is `attestation
-not verified: not registered on-chain per verifier`, not cached as a denial (tapp-server waits
-on that text and retries), and counted as `kms_verifier_total{result="scan_behind"}`. Peer calls
+keeps asking for up to 12s, and does the same when scan cannot answer at all (a 503 when its own
+registry read fails, a timeout), so one RPC hiccup right after a restart does not fail the
+node's start; nothing is admitted without a later `verified: true`. If scan still does not know
+the signer, the answer is `attestation not verified: not registered on-chain per verifier`, not
+cached as a denial (tapp-server waits on that text and retries), and counted as
+`kms_verifier_total{result="scan_behind"}`. Each such request costs scan up to five calls: if a
+whole fleet restarts while scan lags, they count against scan's per-key quota (60/min), and a
+429 reads as "unreachable" — give each KMS node its own API key. Peer calls
 do not wait, since their callers time out in seconds and retry on their own. The KMS's own view
 of the node list works the same way: a signer missing from the cached list triggers one refresh
-(at most one per app every 5s) before it is refused.
+(single-flight per app, at most one per app every 5s) before it is refused.
 
 Two things must be live before the gate is turned on, or nodes deadlock: scan with
 0g-tapp-verifier#16, and on every node that fetches keys from this KMS, a tapp-server with

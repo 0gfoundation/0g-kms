@@ -52,10 +52,12 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 /// the attestation service — seconds, not milliseconds.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long `/app-key` keeps asking when scan does not know a signer this KMS has just found
-/// on chain. Scan follows the chain on a schedule and forces a sync for an unknown target at
-/// most every 10s, so a node that re-registered on restart is usually known within this. Peer
-/// calls pass zero: their callers time out after 3s and retry on their own loops.
+/// How long `/app-key` keeps asking when scan cannot vouch yet for a signer this KMS has just
+/// found on chain: it does not know the signer (404, its registry lags the chain), or it
+/// cannot answer at all (a 503 when its own registry read fails, a timeout). Either way the
+/// signer is admitted only on a later `verified: true`, so asking again admits nothing; it
+/// only keeps one RPC hiccup right after a restart from failing the node's start. Peer calls
+/// pass zero: their callers time out after 3s and retry on their own loops.
 pub const SCAN_LAG_WAIT: Duration = Duration::from_secs(12);
 const SCAN_LAG_POLL: Duration = Duration::from_secs(3);
 
@@ -299,11 +301,11 @@ impl Verifier {
         }
 
         let mut outcome = self.fetch(app_id, signer).await;
-        // A signer with a usable positive is served from it at once if scan does not know it;
-        // only a signer with nothing to fall back on waits for scan to catch up.
+        // A signer with a usable positive is served from it at once if scan cannot vouch;
+        // only a signer with nothing to fall back on waits for scan.
         if !self.has_stale_positive(&key).await {
             let deadline = Instant::now() + scan_lag_wait;
-            while matches!(outcome, Ok(Answer::Unknown))
+            while matches!(outcome, Ok(Answer::Unknown) | Err(_))
                 && Instant::now() + SCAN_LAG_POLL <= deadline
             {
                 tokio::time::sleep(SCAN_LAG_POLL).await;
@@ -723,6 +725,34 @@ mod tests {
         assert!(!e.verified);
         assert_eq!(e.damp, SCAN_LAG_DAMP);
         assert!(SCAN_LAG_DAMP < NEGATIVE_TTL);
+    }
+
+    /// One failed answer from scan (a 503 when its registry read fails) right after a restart
+    /// is asked through, not turned into "unreachable" for a signer already on chain.
+    #[tokio::test]
+    async fn a_transient_scan_error_is_asked_through() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let scan = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/verify"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&scan)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/verify"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"verified": true})),
+            )
+            .expect(1)
+            .mount(&scan)
+            .await;
+
+        let v = Verifier::new(test_cfg(scan.uri())).unwrap();
+        let s: Address = "0x7777777777777777777777777777777777777777".parse().unwrap();
+        assert_eq!(v.require_verified("app", &s, SCAN_LAG_WAIT).await, Ok(()));
     }
 
     /// A signer with a positive past its hourly refresh keeps working if scan does not know it

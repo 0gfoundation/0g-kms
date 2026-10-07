@@ -43,6 +43,13 @@ fn node_list_cache() -> &'static RwLock<HashMap<String, NodeListEntry>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Per-app single-flight for the refreshes a missing signer forces (`get_signer_addresses_for`),
+/// so a flood of requests with random signers for one app cannot queue every other app's.
+fn miss_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Serializes cache refreshes (single-flight): when the TTL lapses under load, exactly one
 /// caller performs the RPC while the burst waits and then reads the refreshed entry — instead
 /// of the whole burst stampeding the rate-limited RPC at once.
@@ -173,8 +180,8 @@ fn cache_key(rpc_url: &str, contract_address: &str, app_id: &str) -> String {
 /// re-registers it with `updateNode` moments before asking for its key; without this it would
 /// be refused for up to `NODE_LIST_TTL` even though the chain already lists it.
 ///
-/// Single-flight like every refresh, and at most one forced refresh per app per
-/// `MISS_REFRESH_MIN`, so a signer that really is unregistered costs next to nothing.
+/// Single-flight per app, and at most one forced refresh per app per `MISS_REFRESH_MIN`, so
+/// a signer that really is unregistered costs next to nothing.
 pub async fn get_signer_addresses_for(
     rpc_url: &str,
     contract_address: &str,
@@ -186,7 +193,8 @@ pub async fn get_signer_addresses_for(
         return Ok(addrs);
     }
     let key = cache_key(rpc_url, contract_address, app_id);
-    let _guard = refresh_lock().lock().await;
+    let lock = miss_locks().lock().await.entry(key.clone()).or_default().clone();
+    let _guard = lock.lock().await;
     if let Some(e) = node_list_cache().read().await.get(&key) {
         let recent = |t: Instant| t.elapsed() < MISS_REFRESH_MIN;
         // Someone refreshed while we waited, or a refresh is too recent to repeat.
