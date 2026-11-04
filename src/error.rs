@@ -13,6 +13,12 @@ pub enum KmsError {
     #[error("app not found on-chain: {0}")]
     AppNotFound(String),
 
+    /// The caller's signer is on-chain but has no verified TEE evidence (attested-admission
+    /// gate, issue #14). Distinct from InvalidSignature — the signature was fine, the *identity
+    /// behind it* hasn't proven it lives in a TEE running the declared code.
+    #[error("attestation required: {0}")]
+    NotAttested(String),
+
     /// The caller sent something malformed — bad hex, a pubkey that is not a valid curve point.
     /// Kept apart from CryptoError on purpose: this is the caller's mistake and the service
     /// behaved correctly, so it must not land in the same bucket as "our crypto broke", which is
@@ -38,6 +44,7 @@ impl IntoResponse for KmsError {
             }
             KmsError::AppNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             KmsError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            KmsError::NotAttested(_) => (StatusCode::FORBIDDEN, self.to_string()),
             KmsError::ChainError(_) | KmsError::CryptoError(_) | KmsError::ConfigError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }

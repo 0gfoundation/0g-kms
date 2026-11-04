@@ -10,6 +10,7 @@ mod metrics;
 mod seal;
 mod server;
 mod tee;
+mod verifier;
 
 use anyhow::{Context, Result};
 use tracing::info;
@@ -83,6 +84,10 @@ async fn main() -> Result<()> {
 
     let config = config::Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path))?;
+
+    // Attested-admission gate (issue #14). Must precede serving: a malformed [verifier]
+    // section fails the boot loudly instead of silently running ungated.
+    verifier::init(&config).context("verifier init")?;
 
     let signing_key = tee::fetch_signing_key(&config.tapp)
         .await

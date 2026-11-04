@@ -106,6 +106,59 @@ fresh genesis.
 | `GET /ready` | — | 200 only when this node holds a share and knows the group pubkey; 503 otherwise |
 | `GET /metrics` | — | Prometheus text exposition (see below) |
 
+## Attested admission
+
+With a `[verifier]` section configured (see `deploy/kms.toml.example`), both admission paths —
+`POST /app-key` callers and inter-node gRPC peers — require, on top of on-chain membership, that
+tappscan has verified the signer's TEE evidence. The on-chain nodeList proves only that the
+*owner* endorsed an address (the contract never sees a quote); this gate is what makes "genuine
+TEE running the declared code" enforced rather than merely audited. Unconfigured = exactly the
+old behaviour.
+
+The KMS pins scan's **attested TLS key** from config — no CA involved — and consumes verdicts
+over that channel. The pinned value is the sha256 of the SPKI DER (curl `--pinnedpubkey`
+convention), which is exactly the `tls_public_key` scan's evidence carries; boot refuses any
+other length, because a raw EC point pasted there would otherwise fail every handshake in a way
+indistinguishable from a scan outage. Verdicts are cached per (app_id, signer); signer keys rotate with the host's
+tapp-server, so cache generations track identity generations for free. Failure is closed *for
+the increment only*: a verified signer keeps working from cache while scan is down, an unseen
+signer is refused. Denials return 403; the app-key counter tags them `result="not_attested"`, and the gate's own
+counter is `kms_verifier_total{result="denied"}`. Note scan's `verified` requires the boot
+chain to match a **published reference set** — so a node running an image whose reference
+values were never published is a definite denial, not an outage; `verifier_denied` therefore
+includes image-class denials, not just revocations. Scan also fails a DEBUG TD, a revoked TCB,
+and on mainnet a dev image (0g-tapp-verifier#16); the KMS reads only `verified` and `reason`.
+A denial is answered from cache for 30s, as `attestation not verified (recently checked):
+<reason>`.
+
+Scan answering 404 for a signer is not a denial. The KMS asks scan only after finding the signer
+in the on-chain list itself, so a 404 means scan has not synced that registration yet — the
+normal state for a node that restarted and re-registered its new signer seconds ago. `/app-key`
+keeps asking for up to 12s, and does the same when scan cannot answer at all (a 503 when its own
+registry read fails, a timeout), so one RPC hiccup right after a restart does not fail the
+node's start; nothing is admitted without a later `verified: true`. If scan still does not know
+the signer, the answer is `attestation not verified: not registered on-chain per verifier`, not
+cached as a denial (tapp-server waits on that text and retries), and counted as
+`kms_verifier_total{result="scan_behind"}`. Each such request costs scan up to five calls: if a
+whole fleet restarts while scan lags, they count against scan's per-key quota (60/min), and a
+429 reads as "unreachable" — give each KMS node its own API key. Peer calls
+do not wait, since their callers time out in seconds and retry on their own. The KMS's own view
+of the node list works the same way: a signer missing from the cached list triggers one refresh
+(single-flight per app, at most one per app every 5s) before it is refused.
+
+Two things must be live before the gate is turned on, or nodes deadlock: scan with
+0g-tapp-verifier#16, and on every node that fetches keys from this KMS, a tapp-server with
+0g-tapp#145 (without it, an encrypted app's evidence is not served until the app has started,
+and the app cannot start without its key).
+
+One liveness note for the runbook: a rogue on-chain entry can never pass gossip under the gate,
+so operations that wait for *full* membership (genesis, /refresh) stall until the entry is
+removed on-chain — the gate holds in the meantime; remove the entry to restore convergence.
+
+Scan itself is never vouched for by its own verdicts: verifying scan is a public, human-
+reproducible act (reference values live in the 0g-tapp-verifier repo), and the pin is its
+output. Design: 0g-kms#14; scan-side counterpart: 0g-tapp-verifier#14.
+
 ## Monitoring
 
 `/metrics` is dependency-free Prometheus text on the same port as the rest of the API. No key
